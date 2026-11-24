@@ -429,36 +429,54 @@ internal sealed class AnchorFinder
         catch { }
     }
 
+    private DateTime _nextMissDiag = DateTime.MinValue;
+
     private bool ScanWindowByAnchorClimb(AutomationElement windowRoot, string stateDir)
     {
-        // Fast native UIA lookup for an exact quota label anchor (no full-tree truncation!).
+        // Fast native UIA lookup (~45ms) for exact quota label anchors.
         var anchors = windowRoot.FindAll(TreeScope.Descendants, QuotaAnchorCondition);
         if (anchors == null || anchors.Count == 0) return false;
 
+        // Only climb from VISIBLE (on-screen) anchors so offscreen chat history never triggers false climbs.
+        var visibleAnchors = new List<AutomationElement>();
+        for (int i = anchors.Count - 1; i >= 0; i--)
+        {
+            try
+            {
+                var el = anchors[i];
+                if (!el.Current.IsOffscreen) visibleAnchors.Add(el);
+            }
+            catch { }
+            if (visibleAnchors.Count >= 6) break;
+        }
+        if (visibleAnchors.Count == 0) return false;
+
         PoolQuotaState bestG = null, bestC = null;
         int bestScore = 0;
+        List<string> diagBestLines = null;
 
-        // Walk upward from the last few matching anchors (portals mount near tree tail).
-        int startIdx = Math.Max(0, anchors.Count - 4);
-        for (int a = anchors.Count - 1; a >= startIdx; a--)
+        foreach (var anchor in visibleAnchors)
         {
-            AutomationElement cur = anchors[a];
-            for (int depth = 0; depth < 8 && cur != null; depth++)
+            AutomationElement cur = anchor;
+            for (int depth = 0; depth < 18 && cur != null; depth++)
             {
                 if (cur == windowRoot) break;
-                var lines = ExtractShortLines(cur, 320);
-                PoolQuotaState g, c;
-                if (UiaQuotaParser.TryParseFromLines(lines, DateTime.UtcNow, out g, out c))
+                var lines = ExtractShortLines(cur, 900);
+                if (lines.Count > 0)
                 {
-                    int score = ScoreQuota(g, c);
-                    if (score > bestScore)
+                    if (diagBestLines == null || (lines.Count > diagBestLines.Count && lines.Count <= 120)) diagBestLines = lines;
+                    PoolQuotaState g, c;
+                    if (UiaQuotaParser.TryParseFromLines(lines, DateTime.UtcNow, out g, out c))
                     {
-                        bestScore = score;
-                        bestG = g;
-                        bestC = c;
+                        int score = ScoreQuota(g, c);
+                        if (score > bestScore)
+                        {
+                            bestScore = score;
+                            bestG = g;
+                            bestC = c;
+                        }
+                        if (bestScore >= 4) break;
                     }
-                    // Found both pools with both windows -> optimal container located!
-                    if (bestScore >= 4) break;
                 }
                 try { cur = TreeWalker.ControlViewWalker.GetParent(cur); }
                 catch { break; }
@@ -478,6 +496,12 @@ internal sealed class AnchorFinder
                 Program.Note("quota-uia-saved: " + summary);
             }
             return true;
+        }
+
+        if (diagBestLines != null && DateTime.UtcNow >= _nextMissDiag)
+        {
+            _nextMissDiag = DateTime.UtcNow.AddSeconds(5);
+            Program.Note("quota-climb-miss(" + diagBestLines.Count + "): " + string.Join(" | ", diagBestLines.Take(35).ToArray()));
         }
         return false;
     }
