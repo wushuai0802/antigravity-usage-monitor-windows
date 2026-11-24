@@ -382,114 +382,36 @@ internal sealed class AnchorFinder
         TryOpportunisticQuotaScan(_root, stateDir);
     }
 
-    private static readonly System.Windows.Automation.Condition QuotaAnchorCondition = new OrCondition(
-        new PropertyCondition(AutomationElement.NameProperty, "剩余每周限制"),
-        new PropertyCondition(AutomationElement.NameProperty, "周限额"),
-        new PropertyCondition(AutomationElement.NameProperty, "模型额度"),
-        new PropertyCondition(AutomationElement.NameProperty, "使用量"),
-        new PropertyCondition(AutomationElement.NameProperty, "Weekly limit"),
-        new PropertyCondition(AutomationElement.NameProperty, "Model quotas"));
     private string _lastSavedQuotaSummary = "";
 
     private void TryOpportunisticQuotaScan(AutomationElement root, string stateDir, bool fastMode = false)
     {
         if (string.IsNullOrEmpty(stateDir) || DateTime.UtcNow < _nextQuotaScan) return;
-        _nextQuotaScan = DateTime.UtcNow.AddMilliseconds(fastMode ? 500 : 1200);
+        _nextQuotaScan = DateTime.UtcNow.AddMilliseconds(fastMode ? 400 : 800);
         try
         {
-            // Scan current root plus any other visible top-level windows of Antigravity (e.g. secondary window or popup HWND).
-            var roots = new List<AutomationElement>();
-            if (root != null) roots.Add(root);
-            var pids = Native.DesktopPids();
-            if (pids.Count > 0)
+            if (root == null) return;
+            // Fast path 1: scan open modal/dialog containers (verified to hold full "模型额度" Gemini + Claude pools).
+            var dialogs = FindQuotaContainers(root);
+            for (int i = dialogs.Count - 1; i >= 0; i--)
             {
-                Native.EnumWindows((w, unused) =>
-                {
-                    if (w == _window || !Native.Live(w)) return true;
-                    uint pid;
-                    Native.GetWindowThreadProcessId(w, out pid);
-                    if (pids.Contains((int)pid))
-                    {
-                        try
-                        {
-                            var el = AutomationElement.FromHandle(w);
-                            if (el != null) roots.Add(el);
-                        }
-                        catch { }
-                    }
-                    return true;
-                }, IntPtr.Zero);
-            }
-
-            foreach (var r in roots)
-            {
-                if (ScanWindowByAnchorClimb(r, stateDir)) return;
+                if (ParseContainerForQuota(dialogs[i], stateDir)) return;
             }
         }
         catch { }
     }
 
-    private DateTime _nextMissDiag = DateTime.MinValue;
-
-    private bool ScanWindowByAnchorClimb(AutomationElement windowRoot, string stateDir)
+    private bool ParseContainerForQuota(AutomationElement container, string stateDir)
     {
-        // Fast native UIA lookup (~45ms) for exact quota label anchors.
-        var anchors = windowRoot.FindAll(TreeScope.Descendants, QuotaAnchorCondition);
-        if (anchors == null || anchors.Count == 0) return false;
-
-        // Only climb from VISIBLE (on-screen) anchors so offscreen chat history never triggers false climbs.
-        var visibleAnchors = new List<AutomationElement>();
-        for (int i = anchors.Count - 1; i >= 0; i--)
+        var lines = ExtractShortLines(container, 1200);
+        if (lines.Count == 0) return false;
+        PoolQuotaState g, c;
+        if (UiaQuotaParser.TryParseFromLines(lines, DateTime.UtcNow, out g, out c))
         {
-            try
-            {
-                var el = anchors[i];
-                if (!el.Current.IsOffscreen) visibleAnchors.Add(el);
-            }
-            catch { }
-            if (visibleAnchors.Count >= 6) break;
-        }
-        if (visibleAnchors.Count == 0) return false;
-
-        PoolQuotaState bestG = null, bestC = null;
-        int bestScore = 0;
-        List<string> diagBestLines = null;
-
-        foreach (var anchor in visibleAnchors)
-        {
-            AutomationElement cur = anchor;
-            for (int depth = 0; depth < 18 && cur != null; depth++)
-            {
-                if (cur == windowRoot) break;
-                var lines = ExtractShortLines(cur, 900);
-                if (lines.Count > 0)
-                {
-                    if (diagBestLines == null || (lines.Count > diagBestLines.Count && lines.Count <= 120)) diagBestLines = lines;
-                    PoolQuotaState g, c;
-                    if (UiaQuotaParser.TryParseFromLines(lines, DateTime.UtcNow, out g, out c))
-                    {
-                        int score = ScoreQuota(g, c);
-                        if (score > bestScore)
-                        {
-                            bestScore = score;
-                            bestG = g;
-                            bestC = c;
-                        }
-                        if (bestScore >= 4) break;
-                    }
-                }
-                try { cur = TreeWalker.ControlViewWalker.GetParent(cur); }
-                catch { break; }
-            }
-            if (bestScore >= 4) break;
-        }
-
-        if (bestG != null || bestC != null)
-        {
-            DualSlotStore.WriteQuotaFromUia(stateDir, bestG, bestC, DateTime.UtcNow);
+            DualSlotStore.WriteQuotaFromUia(stateDir, g, c, DateTime.UtcNow);
             string summary = string.Format("G={0} C={1}",
-                bestG == null ? "null" : (bestG.RemainingPct + "%(5h=" + (bestG.FiveHour != null ? bestG.FiveHour.RemainingPct.ToString() : "-") + ",7d=" + (bestG.Weekly != null ? bestG.Weekly.RemainingPct.ToString() : "-") + ")"),
-                bestC == null ? "null" : (bestC.RemainingPct + "%(5h=" + (bestC.FiveHour != null ? bestC.FiveHour.RemainingPct.ToString() : "-") + ",7d=" + (bestC.Weekly != null ? bestC.Weekly.RemainingPct.ToString() : "-") + ")"));
+                g == null ? "null" : (g.RemainingPct + "%(5h=" + (g.FiveHour != null ? g.FiveHour.RemainingPct.ToString() : "-") + ",7d=" + (g.Weekly != null ? g.Weekly.RemainingPct.ToString() : "-") + ")"),
+                c == null ? "null" : (c.RemainingPct + "%(5h=" + (c.FiveHour != null ? c.FiveHour.RemainingPct.ToString() : "-") + ",7d=" + (c.Weekly != null ? c.Weekly.RemainingPct.ToString() : "-") + ")"));
             if (summary != _lastSavedQuotaSummary)
             {
                 _lastSavedQuotaSummary = summary;
@@ -497,21 +419,45 @@ internal sealed class AnchorFinder
             }
             return true;
         }
-
-        if (diagBestLines != null && DateTime.UtcNow >= _nextMissDiag)
-        {
-            _nextMissDiag = DateTime.UtcNow.AddSeconds(5);
-            Program.Note("quota-climb-miss(" + diagBestLines.Count + "): " + string.Join(" | ", diagBestLines.Take(35).ToArray()));
-        }
         return false;
     }
 
-    private static int ScoreQuota(PoolQuotaState g, PoolQuotaState c)
+    private static List<AutomationElement> FindQuotaContainers(AutomationElement root)
     {
-        int s = 0;
-        if (g != null) { s += 1; if (g.FiveHour != null && g.Weekly != null) s += 1; }
-        if (c != null) { s += 1; if (c.FiveHour != null && c.Weekly != null) s += 1; }
-        return s;
+        var result = new List<AutomationElement>();
+        try
+        {
+            var cond = new OrCondition(
+                new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Window),
+                new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Menu),
+                new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Pane),
+                new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Group));
+            var all = root.FindAll(TreeScope.Descendants, cond);
+            for (int i = 0; i < all.Count; i++)
+            {
+                try
+                {
+                    var el = all[i];
+                    if (el.Current.IsOffscreen) continue;
+                    var ct = el.Current.ControlType;
+                    if (ct == ControlType.Menu)
+                    {
+                        result.Add(el);
+                        continue;
+                    }
+                    string localized = (el.Current.LocalizedControlType ?? "").ToLowerInvariant();
+                    string cls = (el.Current.ClassName ?? "").ToLowerInvariant();
+                    if (localized.Contains("dialog") || localized.Contains("对话框")
+                        || cls.Contains("dialog") || cls.Contains("modal") || cls.Contains("popover") || cls.Contains("popup"))
+                    {
+                        result.Add(el);
+                    }
+                }
+                catch { }
+            }
+        }
+        catch { }
+        return result;
     }
 
     private static List<string> ExtractShortLines(AutomationElement container, int maxNodes)
@@ -519,13 +465,8 @@ internal sealed class AnchorFinder
         var lines = new List<string>();
         try
         {
-            var cond = new OrCondition(
-                new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Text),
-                new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Header),
-                new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.MenuItem),
-                new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.ListItem));
-            var nodes = container.FindAll(TreeScope.Descendants, cond);
-            if (nodes.Count > maxNodes) return lines; // Skip oversized ancestors (e.g. entire chat document).
+            var nodes = container.FindAll(TreeScope.Descendants, System.Windows.Automation.Condition.TrueCondition);
+            if (nodes.Count > maxNodes) return lines;
             for (int i = 0; i < nodes.Count; i++)
             {
                 try
