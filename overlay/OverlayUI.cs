@@ -608,15 +608,37 @@ internal sealed class OverlayController
     private StackPanel BuildPoolBlock(string title, PoolQuotaState p, Brush accent, ThemePalette pal)
     {
         var sp = new StackPanel { Margin = new Thickness(0, 0, 0, 6) };
+        if (p.FiveHour != null && p.Weekly != null)
+        {
+            sp.Children.Add(new TextBlock
+            {
+                Text = title,
+                FontFamily = UiFont,
+                FontSize = 11.5,
+                FontWeight = FontWeights.SemiBold,
+                Foreground = pal.InkPrimary,
+                Margin = new Thickness(0, 0, 0, 2)
+            });
+            sp.Children.Add(BuildSingleWindowBar("5h 限制", p.FiveHour, accent, pal));
+            sp.Children.Add(BuildSingleWindowBar("7d 限制", p.Weekly, accent, pal));
+            return sp;
+        }
+        string badge = string.IsNullOrEmpty(p.WindowKind) ? "" : (" [" + p.WindowKind + "]");
+        sp.Children.Add(BuildSingleWindowBar(title + badge, p, accent, pal));
+        return sp;
+    }
+
+    private StackPanel BuildSingleWindowBar(string label, PoolQuotaState p, Brush accent, ThemePalette pal)
+    {
+        var sp = new StackPanel { Margin = new Thickness(0, 0, 0, 3) };
         Brush barBrush = accent;
         if (p.Alert == QuotaAlertLevel.Critical7d) barBrush = pal.CritBrush;
         else if (p.Alert == QuotaAlertLevel.Warn5h) barBrush = pal.WarnBrush;
 
-        string badge = string.IsNullOrEmpty(p.WindowKind) ? "" : (" [" + p.WindowKind + "]");
         string rightVal = p.Alert == QuotaAlertLevel.ResetPassed
             ? "已重置"
             : string.Format(CultureInfo.InvariantCulture, "{0:0}% · {1}", p.RemainingPct, p.CountdownText);
-        sp.Children.Add(MakeKv(title + badge, rightVal, pal, barBrush));
+        sp.Children.Add(MakeKv(label, rightVal, pal, barBrush));
         sp.Children.Add(MakeProgressBar(p.RemainingPct, barBrush, pal));
         if (!string.IsNullOrEmpty(p.AlertHint))
         {
@@ -626,7 +648,7 @@ internal sealed class OverlayController
                 FontFamily = UiFont,
                 FontSize = 10.5,
                 Foreground = barBrush,
-                Margin = new Thickness(0, 2, 0, 0)
+                Margin = new Thickness(0, 1, 0, 0)
             });
         }
         return sp;

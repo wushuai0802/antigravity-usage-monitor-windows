@@ -82,23 +82,36 @@ internal static class OverlayTests
 
     private static void TestUiaQuotaParser()
     {
-        var now = new DateTime(2026, 11, 24, 3, 0, 0, DateTimeKind.Utc);
+        var now = new DateTime(2026, 11, 24, 3, 25, 0, DateTimeKind.Utc);
+        // Exact real Antigravity 2.0 Chinese "模型额度" modal lines
         var lines = new[]
         {
-            "Models & Quotas",
-            "Gemini models",
-            "25% remaining",
-            "Resets in 3h 15m",
-            "Claude and GPT models",
-            "12% remaining",
-            "Resets in 4h 0m",
-            "Context window: 85% used"
+            "模型额度",
+            "启用 AI 额度超量使用",
+            "编排模型",
+            "Gemini 4 Neon Extra High",
+            "Gemini 模型",
+            "剩余每周限制",
+            "6 天 16 小时后刷新",
+            "70%",
+            "剩余五小时限制",
+            "2 小时 43 分钟后刷新",
+            "5%",
+            "Claude 和 GPT 模型",
+            "剩余每周限制",
+            "6 天 22 小时后刷新",
+            "56%",
+            "剩余五小时限制",
+            "3 小时 25 分钟后刷新",
+            "12%"
         };
         PoolQuotaState g, c;
         bool ok = UiaQuotaParser.TryParseFromLines(lines, now, out g, out c);
-        Assert(ok && g != null && c != null, "UIA parser should extract both pools");
-        Assert(Math.Abs(g.RemainingPct - 25.0) < 0.01 && g.WindowKind == "5h", "Gemini pool should be 25% 5h");
-        Assert(Math.Abs(c.RemainingPct - 12.0) < 0.01 && c.WindowKind == "5h", "Claude pool should be 12% 5h");
+        Assert(ok && g != null && c != null, "UIA parser should extract both pools from real Chinese modal");
+        Assert(g.FiveHour != null && Math.Abs(g.FiveHour.RemainingPct - 5.0) < 0.01 && g.FiveHour.Alert == QuotaAlertLevel.Warn5h, "Gemini 5h should be 5% warn");
+        Assert(g.Weekly != null && Math.Abs(g.Weekly.RemainingPct - 70.0) < 0.01 && g.Weekly.WindowKind == "7d", "Gemini 7d should be 70%");
+        Assert(c.FiveHour != null && Math.Abs(c.FiveHour.RemainingPct - 12.0) < 0.01 && c.FiveHour.WindowKind == "5h", "Claude 5h should be 12%");
+        Assert(c.Weekly != null && Math.Abs(c.Weekly.RemainingPct - 56.0) < 0.01 && c.Weekly.WindowKind == "7d", "Claude 7d should be 56%");
 
         // Guard: ordinary chat lines mentioning percentages must NOT be misread as quota
         var chatLines = new[]

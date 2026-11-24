@@ -384,12 +384,13 @@ internal sealed class AnchorFinder
     private void TryOpportunisticQuotaScan(AutomationElement root, string stateDir)
     {
         if (string.IsNullOrEmpty(stateDir) || DateTime.UtcNow < _nextQuotaScan) return;
-        _nextQuotaScan = DateTime.UtcNow.AddSeconds(5);
+        _nextQuotaScan = DateTime.UtcNow.AddSeconds(2);
         try
         {
             var texts = root.FindAll(TreeScope.Descendants, new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Text));
             var lines = new List<string>();
-            int limit = Math.Min(texts.Count, 300);
+            // Scan full visible text tree (settings/quota modal typically mounts near the tail of the DOM).
+            int limit = Math.Min(texts.Count, 1800);
             for (int i = 0; i < limit; i++)
             {
                 try

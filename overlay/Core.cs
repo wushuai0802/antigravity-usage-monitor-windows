@@ -24,6 +24,9 @@ internal sealed class PoolQuotaState
     internal QuotaAlertLevel Alert;
     internal string AlertHint;
     internal string CountdownText;
+    // Optional secondary window when both 5h and 7d limits are available (e.g. from Antigravity "模型额度" page)
+    internal PoolQuotaState FiveHour;
+    internal PoolQuotaState Weekly;
 }
 
 internal sealed class QuotaSnapshot
@@ -252,8 +255,12 @@ internal static class QuotaEvaluator
 internal static class UiaQuotaParser
 {
     private static readonly Regex PctRegex = new Regex(@"(?<!\d)(\d{1,3}(?:\.\d+)?)\s*%", RegexOptions.Compiled);
-    private static readonly Regex RelativeResetRegex = new Regex(@"(?:(\d+)\s*(?:d|day|days|天))?\s*(?:(\d+)\s*(?:h|hr|hrs|hour|hours|小时))?\s*(?:(\d+)\s*(?:m|min|mins|minute|minutes|分钟|分))", RegexOptions.IgnoreCase | RegexOptions.Compiled);
-    private static readonly Regex QuotaHeaderRegex = new Regex(@"(models?\s*&\s*(?:quota|usage)|usage\s+limits?|model\s+quotas?|模型与配额|额度与用量|配额概览)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex RelativeResetRegex = new Regex(
+        @"(?:(\d+)\s*(?:d|day|days|天))?\s*(?:(\d+)\s*(?:h|hr|hrs|hour|hours|小时))?\s*(?:(\d+)\s*(?:m|min|mins|minute|minutes|分钟|分))?",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex QuotaHeaderRegex = new Regex(
+        @"(模型额度|剩余每周限制|剩余五小时限制|models?\s*&\s*(?:quota|usage)|model\s+quotas?|usage\s+limits?|weekly\s+limit|5-?hour\s+limit|模型与配额)",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
     internal static bool TryParseFromLines(IEnumerable<string> lines, DateTime nowUtc, out PoolQuotaState gemini, out PoolQuotaState claude)
     {
@@ -270,74 +277,144 @@ internal static class UiaQuotaParser
             list.Add(line);
             if (!hasQuotaHeader && QuotaHeaderRegex.IsMatch(line)) hasQuotaHeader = true;
         }
-        // Strict gate 1: require an explicit quota/usage panel heading so chat messages are never misread.
+        // Strict gate 1: require an explicit quota panel heading so chat messages are never misread.
         if (!hasQuotaHeader) return false;
 
-        string currentSection = "";
+        PoolQuotaState g5 = null, g7 = null, c5 = null, c7 = null;
+        string currentPool = "";
+        string currentWindow = ""; // "5h" or "7d" or ""
+        DateTime? pendingReset = null;
+        double? pendingPct = null;
+
+        Action commitPending = () =>
+        {
+            if (string.IsNullOrEmpty(currentPool) || !pendingPct.HasValue || !pendingReset.HasValue) return;
+            PoolQuotaState st = QuotaEvaluator.Evaluate(currentPool, pendingPct.Value, pendingReset, nowUtc);
+            string kind = !string.IsNullOrEmpty(currentWindow) ? currentWindow : st.WindowKind;
+            if (kind == "7d")
+            {
+                st.WindowKind = "7d";
+                if (currentPool == "gemini") g7 = st;
+                else if (currentPool == "claude") c7 = st;
+            }
+            else
+            {
+                st.WindowKind = "5h";
+                if (currentPool == "gemini") g5 = st;
+                else if (currentPool == "claude") c5 = st;
+            }
+            pendingReset = null;
+            pendingPct = null;
+        };
+
         foreach (string line in list)
         {
             string low = line.ToLowerInvariant();
 
-            if (low.Contains("gemini") || low.Contains("neon") || low.Contains("argon") || low.Contains("flash"))
+            if (low == "gemini 模型" || low == "gemini models" || (low.Contains("gemini") && (low.Contains("模型") || low.Contains("model")) && !low.Contains("orchestrator") && !low.Contains("extra") && !low.Contains("high")))
             {
-                currentSection = "gemini";
+                commitPending();
+                currentPool = "gemini";
+                currentWindow = "";
+                pendingReset = null;
+                pendingPct = null;
+                continue;
             }
-            else if (low.Contains("claude") || low.Contains("opus") || low.Contains("sonnet") || low.Contains("gpt-oss") || low.Contains("third-party"))
+            if (low.Contains("claude") && (low.Contains("模型") || low.Contains("model") || low.Contains("gpt")))
             {
-                currentSection = "claude";
+                commitPending();
+                currentPool = "claude";
+                currentWindow = "";
+                pendingReset = null;
+                pendingPct = null;
+                continue;
             }
 
-            if (string.IsNullOrEmpty(currentSection)) continue;
-            if (!low.Contains("%") && !low.Contains("reset") && !low.Contains("重置")) continue;
+            if (string.IsNullOrEmpty(currentPool)) continue;
+
+            if (low.Contains("每周限制") || low.Contains("weekly"))
+            {
+                commitPending();
+                currentWindow = "7d";
+                pendingReset = null;
+                pendingPct = null;
+            }
+            else if (low.Contains("五小时限制") || low.Contains("5小时") || low.Contains("5-hour") || low.Contains("five-hour") || low.Contains("5 hour"))
+            {
+                commitPending();
+                currentWindow = "5h";
+                pendingReset = null;
+                pendingPct = null;
+            }
+
+            DateTime? resetUtc = TryParseResetTime(line, nowUtc);
+            if (resetUtc.HasValue) pendingReset = resetUtc;
 
             Match pm = PctRegex.Match(line);
-            DateTime? resetUtc = TryParseResetTime(line, nowUtc);
             if (pm.Success)
             {
                 double pct;
                 if (double.TryParse(pm.Groups[1].Value, NumberStyles.Float, CultureInfo.InvariantCulture, out pct) && pct >= 0 && pct <= 100)
                 {
-                    if (low.Contains("context") || low.Contains("上下文") || low.Contains("cache") || low.Contains("缓存")) continue;
-                    if (low.Contains("used") || low.Contains("已用")) pct = Math.Max(0, 100.0 - pct);
-
-                    PoolQuotaState candidate = QuotaEvaluator.Evaluate(currentSection, pct, resetUtc, nowUtc);
-                    if (currentSection == "gemini")
+                    if (!low.Contains("context") && !low.Contains("上下文") && !low.Contains("cache") && !low.Contains("缓存"))
                     {
-                        if (gemini == null || pct < gemini.RemainingPct) gemini = candidate;
-                    }
-                    else if (currentSection == "claude")
-                    {
-                        if (claude == null || pct < claude.RemainingPct) claude = candidate;
+                        if (low.Contains("used") || low.Contains("已用")) pct = Math.Max(0, 100.0 - pct);
+                        pendingPct = pct;
                     }
                 }
             }
-            else if (resetUtc.HasValue)
+
+            if (pendingPct.HasValue && pendingReset.HasValue)
             {
-                if (currentSection == "gemini" && gemini != null && !gemini.ResetAtUtc.HasValue)
-                {
-                    gemini = QuotaEvaluator.Evaluate("gemini", gemini.RemainingPct, resetUtc, nowUtc);
-                }
-                else if (currentSection == "claude" && claude != null && !claude.ResetAtUtc.HasValue)
-                {
-                    claude = QuotaEvaluator.Evaluate("claude", claude.RemainingPct, resetUtc, nowUtc);
-                }
+                commitPending();
             }
         }
-        // Strict gate 2: only accept a pool when BOTH percentage and reset time were parsed.
-        if (gemini != null && !gemini.ResetAtUtc.HasValue) gemini = null;
-        if (claude != null && !claude.ResetAtUtc.HasValue) claude = null;
+        commitPending();
+
+        gemini = CombinePool("gemini", g5, g7);
+        claude = CombinePool("claude", c5, c7);
         return gemini != null || claude != null;
+    }
+
+    internal static PoolQuotaState CombinePool(string pool, PoolQuotaState fiveHour, PoolQuotaState weekly)
+    {
+        if (fiveHour == null && weekly == null) return null;
+        // Pick the tighter active window as primary (for compact strip & top alert), keep both attached for detail panel.
+        PoolQuotaState primary;
+        if (fiveHour != null && weekly != null)
+        {
+            if (weekly.Alert == QuotaAlertLevel.Critical7d) primary = weekly;
+            else if (fiveHour.Alert == QuotaAlertLevel.Warn5h) primary = fiveHour;
+            else primary = (fiveHour.RemainingPct <= weekly.RemainingPct) ? fiveHour : weekly;
+        }
+        else
+        {
+            primary = fiveHour ?? weekly;
+        }
+        return new PoolQuotaState
+        {
+            Pool = pool,
+            RemainingPct = primary.RemainingPct,
+            ResetAtUtc = primary.ResetAtUtc,
+            WindowKind = primary.WindowKind,
+            Alert = primary.Alert,
+            AlertHint = primary.AlertHint,
+            CountdownText = primary.CountdownText,
+            FiveHour = fiveHour,
+            Weekly = weekly
+        };
     }
 
     internal static DateTime? TryParseResetTime(string text, DateTime nowUtc)
     {
         if (string.IsNullOrWhiteSpace(text)) return null;
         string low = text.ToLowerInvariant();
-        if (!low.Contains("reset") && !low.Contains("重置") && !low.Contains("恢复")) return null;
+        if (!low.Contains("reset") && !low.Contains("重置") && !low.Contains("恢复") && !low.Contains("刷新") && !low.Contains("refresh")) return null;
 
-        Match m = RelativeResetRegex.Match(text);
-        if (m.Success)
+        MatchCollection matches = RelativeResetRegex.Matches(text);
+        foreach (Match m in matches)
         {
+            if (!m.Success || string.IsNullOrWhiteSpace(m.Value)) continue;
             int d = ParseIntGroup(m.Groups[1]);
             int h = ParseIntGroup(m.Groups[2]);
             int min = ParseIntGroup(m.Groups[3]);
@@ -396,18 +473,8 @@ internal static class DualSlotStore
             int prevSeq = existing != null ? GetInt(existing, "sequence", 0) : 0;
 
             var pools = new Dictionary<string, object>();
-            if (gemini != null)
-            {
-                var g = new Dictionary<string, object> { { "remainingPct", Math.Round(gemini.RemainingPct, 2) } };
-                if (gemini.ResetAtUtc.HasValue) g["resetAt"] = gemini.ResetAtUtc.Value.ToString("yyyy-MM-ddTHH:mm:ssZ", CultureInfo.InvariantCulture);
-                pools["gemini"] = g;
-            }
-            if (claude != null)
-            {
-                var c = new Dictionary<string, object> { { "remainingPct", Math.Round(claude.RemainingPct, 2) } };
-                if (claude.ResetAtUtc.HasValue) c["resetAt"] = claude.ResetAtUtc.Value.ToString("yyyy-MM-ddTHH:mm:ssZ", CultureInfo.InvariantCulture);
-                pools["claude"] = c;
-            }
+            if (gemini != null) pools["gemini"] = SerializePool(gemini);
+            if (claude != null) pools["claude"] = SerializePool(claude);
 
             int seq = prevSeq + 1;
             var doc = new Dictionary<string, object>
@@ -508,6 +575,25 @@ internal static class DualSlotStore
         return snap;
     }
 
+    private static Dictionary<string, object> SerializePool(PoolQuotaState p)
+    {
+        var d = new Dictionary<string, object> { { "remainingPct", Math.Round(p.RemainingPct, 2) } };
+        if (p.ResetAtUtc.HasValue) d["resetAt"] = p.ResetAtUtc.Value.ToString("yyyy-MM-ddTHH:mm:ssZ", CultureInfo.InvariantCulture);
+        if (p.FiveHour != null)
+        {
+            var fh = new Dictionary<string, object> { { "remainingPct", Math.Round(p.FiveHour.RemainingPct, 2) } };
+            if (p.FiveHour.ResetAtUtc.HasValue) fh["resetAt"] = p.FiveHour.ResetAtUtc.Value.ToString("yyyy-MM-ddTHH:mm:ssZ", CultureInfo.InvariantCulture);
+            d["fiveHour"] = fh;
+        }
+        if (p.Weekly != null)
+        {
+            var wk = new Dictionary<string, object> { { "remainingPct", Math.Round(p.Weekly.RemainingPct, 2) } };
+            if (p.Weekly.ResetAtUtc.HasValue) wk["resetAt"] = p.Weekly.ResetAtUtc.Value.ToString("yyyy-MM-ddTHH:mm:ssZ", CultureInfo.InvariantCulture);
+            d["weekly"] = wk;
+        }
+        return d;
+    }
+
     private static QuotaSnapshot ParseQuotaDoc(Dictionary<string, object> qdoc, DateTime nowUtc)
     {
         if (qdoc == null) return null;
@@ -521,20 +607,31 @@ internal static class DualSlotStore
         var pools = GetMap(qdoc, "pools");
         if (pools != null)
         {
-            var gmap = GetMap(pools, "gemini");
-            if (gmap != null)
-            {
-                double? pct = GetNullableDouble(gmap, "remainingPct");
-                if (pct.HasValue) qs.Gemini = QuotaEvaluator.Evaluate("gemini", pct.Value, ParseUtc(GetStr(gmap, "resetAt", "")), nowUtc);
-            }
-            var cmap = GetMap(pools, "claude");
-            if (cmap != null)
-            {
-                double? pct = GetNullableDouble(cmap, "remainingPct");
-                if (pct.HasValue) qs.Claude = QuotaEvaluator.Evaluate("claude", pct.Value, ParseUtc(GetStr(cmap, "resetAt", "")), nowUtc);
-            }
+            qs.Gemini = ParsePoolMap("gemini", GetMap(pools, "gemini"), nowUtc);
+            qs.Claude = ParsePoolMap("claude", GetMap(pools, "claude"), nowUtc);
         }
         return (qs.Gemini != null || qs.Claude != null) ? qs : null;
+    }
+
+    private static PoolQuotaState ParsePoolMap(string pool, Dictionary<string, object> pmap, DateTime nowUtc)
+    {
+        if (pmap == null) return null;
+        PoolQuotaState fh = null, wk = null;
+        var fhMap = GetMap(pmap, "fiveHour");
+        if (fhMap != null)
+        {
+            double? pct = GetNullableDouble(fhMap, "remainingPct");
+            if (pct.HasValue) fh = QuotaEvaluator.Evaluate(pool, pct.Value, ParseUtc(GetStr(fhMap, "resetAt", "")), nowUtc);
+        }
+        var wkMap = GetMap(pmap, "weekly");
+        if (wkMap != null)
+        {
+            double? pct = GetNullableDouble(wkMap, "remainingPct");
+            if (pct.HasValue) wk = QuotaEvaluator.Evaluate(pool, pct.Value, ParseUtc(GetStr(wkMap, "resetAt", "")), nowUtc);
+        }
+        if (fh != null || wk != null) return UiaQuotaParser.CombinePool(pool, fh, wk);
+        double? singlePct = GetNullableDouble(pmap, "remainingPct");
+        return singlePct.HasValue ? QuotaEvaluator.Evaluate(pool, singlePct.Value, ParseUtc(GetStr(pmap, "resetAt", "")), nowUtc) : null;
     }
 
     internal static DateTime? ParseUtc(string raw)
