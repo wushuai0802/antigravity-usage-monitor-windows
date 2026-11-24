@@ -47,13 +47,18 @@ if (-not $SkipHooks) {
   Write-Host "Updated Windows hooks: $winHooks"
 
   if (-not $SkipWslHooks -and (Get-Command wsl.exe -ErrorAction SilentlyContinue)) {
+    $prevEap = $ErrorActionPreference
     try {
-      $wslCollect = (& wsl.exe wslpath -u $winCollect 2>$null | Select-Object -First 1)
-      $wslState = (& wsl.exe wslpath -u $StateRoot 2>$null | Select-Object -First 1)
-      if ($wslCollect) {
+      # WSL prints a benign localhost-proxy notice on stderr under NAT mode; do not let PowerShell 5.1 treat stderr as fatal.
+      $ErrorActionPreference = 'Continue'
+      $wslCollectLines = @(& wsl.exe -e wslpath -u $winCollect 2>$null | Where-Object { $_ -and $_ -notmatch '^wsl:' })
+      $wslCollect = if ($wslCollectLines.Count -gt 0) { [string]$wslCollectLines[0] } else { '' }
+      $wslStateLines = @(& wsl.exe -e wslpath -u $StateRoot 2>$null | Where-Object { $_ -and $_ -notmatch '^wsl:' })
+      $wslState = if ($wslStateLines.Count -gt 0) { [string]$wslStateLines[0] } else { '' }
+      if ($wslCollect -and $wslState) {
         $wslCollect = $wslCollect.Trim()
         $wslState = $wslState.Trim()
-        $pyMerge = @"
+        $pyMerge = @'
 import json, os, shutil
 from pathlib import Path
 hooks_path = Path.home() / '.gemini' / 'config' / 'hooks.json'
@@ -74,12 +79,20 @@ data['antigravity-usage-monitor'] = {
 }
 hooks_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
 print('Updated WSL hooks:', hooks_path)
-"@
-        & wsl.exe env "AGY_WSL_COLLECT=$wslCollect" python3 -c $pyMerge
-        & wsl.exe python3 $wslCollect --scan-only --state-dir $wslState 2>$null
+'@
+        $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($pyMerge))
+        $mergeOut = & wsl.exe -e env "AGY_WSL_COLLECT=$wslCollect" python3 -c "import base64; exec(base64.b64decode('$b64').decode('utf-8'))" 2>$null
+        if ($LASTEXITCODE -eq 0) {
+          $mergeOut | ForEach-Object { Write-Host $_ }
+          & wsl.exe -e python3 $wslCollect --scan-only --state-dir $wslState 2>$null | Out-Null
+        } else {
+          Write-Warning "WSL hook merge exited with code $LASTEXITCODE"
+        }
       }
     } catch {
       Write-Warning "WSL hook setup skipped: $($_.Exception.Message)"
+    } finally {
+      $ErrorActionPreference = $prevEap
     }
   }
 }

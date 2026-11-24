@@ -3,12 +3,17 @@ $Script:OverlayExe = Join-Path $Script:StateRoot 'bin\AntigravityUsageOverlay.ex
 $Script:HookKey = 'antigravity-usage-monitor'
 
 function Stop-Overlay {
-  Get-Process -Name 'AntigravityUsageOverlay' -ErrorAction SilentlyContinue | ForEach-Object {
-    try { $_.CloseMainWindow() | Out-Null } catch {}
+  $procs = @(Get-Process -Name 'AntigravityUsageOverlay' -ErrorAction SilentlyContinue)
+  foreach ($p in $procs) {
+    try { $p.CloseMainWindow() | Out-Null } catch {}
     try {
-      if (-not $_.WaitForExit(1500)) { $_.Kill() }
+      if (-not $p.WaitForExit(1000)) {
+        $p.Kill()
+        $p.WaitForExit(3000) | Out-Null
+      }
     } catch {}
   }
+  if ($procs.Count -gt 0) { Start-Sleep -Milliseconds 200 }
 }
 
 function Merge-HooksJson {

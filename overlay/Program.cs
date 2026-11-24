@@ -64,7 +64,7 @@ internal static class Program
                 psi = new ProcessStartInfo
                 {
                     FileName = "wsl.exe",
-                    Arguments = string.Format("python3 \"{0}\" --scan-only --state-dir \"{1}\"", wslScript, wslState),
+                    Arguments = string.Format("-e python3 \"{0}\" --scan-only --state-dir \"{1}\"", wslScript, wslState),
                     UseShellExecute = false,
                     CreateNoWindow = true,
                     WindowStyle = ProcessWindowStyle.Hidden
