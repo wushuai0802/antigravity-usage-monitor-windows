@@ -387,103 +387,128 @@ internal sealed class AnchorFinder
     private void TryOpportunisticQuotaScan(AutomationElement root, string stateDir, bool fastMode = false)
     {
         if (string.IsNullOrEmpty(stateDir) || DateTime.UtcNow < _nextQuotaScan) return;
-        _nextQuotaScan = DateTime.UtcNow.AddMilliseconds(fastMode ? 400 : 800);
+        _nextQuotaScan = DateTime.UtcNow.AddMilliseconds(fastMode ? 350 : 700);
         try
         {
             if (root == null) return;
-            // Fast path 1: scan open modal/dialog containers (verified to hold full "模型额度" Gemini + Claude pools).
-            var dialogs = FindQuotaContainers(root);
-            for (int i = dialogs.Count - 1; i >= 0; i--)
+            // Locate Electron's RootWebArea Document by skipping owned WPF Window children so overlay redraws never throw ElementNotAvailableException.
+            var docs = FindWebDocuments(root);
+            var walker = TreeWalker.ControlViewWalker;
+            for (int d = docs.Count - 1; d >= 0; d--)
             {
-                if (ParseContainerForQuota(dialogs[i], stateDir)) return;
+                AutomationElement themeRoot = null;
+                try { themeRoot = walker.GetFirstChild(docs[d]); } catch { }
+                if (themeRoot == null) continue;
+
+                // Under themeRoot: GRAND[0] has AutomationId == "root" (main chat app).
+                // All sibling nodes (AID != "root") are React/Base-UI portals (model menu, Usage popover, "模型额度" settings modal).
+                var portalLines = new List<string>();
+                AutomationElement sibling = null;
+                try { sibling = walker.GetFirstChild(themeRoot); } catch { }
+                int sibGuard = 0;
+                while (sibling != null && sibGuard++ < 32)
+                {
+                    try
+                    {
+                        string aid = sibling.Current.AutomationId ?? "";
+                        if (!string.Equals(aid, "root", StringComparison.OrdinalIgnoreCase)
+                            && !aid.StartsWith("a11y-live-announcer", StringComparison.OrdinalIgnoreCase))
+                        {
+                            CollectLinesFaultTolerant(sibling, portalLines, 600);
+                        }
+                    }
+                    catch { }
+                    try { sibling = walker.GetNextSibling(sibling); } catch { break; }
+                }
+
+                if (portalLines.Count > 0 && TryCommitQuotaLines(portalLines, stateDir)) return;
             }
         }
         catch { }
     }
 
-    private bool ParseContainerForQuota(AutomationElement container, string stateDir)
+    private static List<AutomationElement> FindWebDocuments(AutomationElement root)
     {
-        var lines = ExtractShortLines(container, 1200);
-        if (lines.Count == 0) return false;
-        PoolQuotaState g, c;
-        if (UiaQuotaParser.TryParseFromLines(lines, DateTime.UtcNow, out g, out c))
-        {
-            DualSlotStore.WriteQuotaFromUia(stateDir, g, c, DateTime.UtcNow);
-            string summary = string.Format("G={0} C={1}",
-                g == null ? "null" : (g.RemainingPct + "%(5h=" + (g.FiveHour != null ? g.FiveHour.RemainingPct.ToString() : "-") + ",7d=" + (g.Weekly != null ? g.Weekly.RemainingPct.ToString() : "-") + ")"),
-                c == null ? "null" : (c.RemainingPct + "%(5h=" + (c.FiveHour != null ? c.FiveHour.RemainingPct.ToString() : "-") + ",7d=" + (c.Weekly != null ? c.Weekly.RemainingPct.ToString() : "-") + ")"));
-            if (summary != _lastSavedQuotaSummary)
-            {
-                _lastSavedQuotaSummary = summary;
-                Program.Note("quota-uia-saved: " + summary);
-            }
-            return true;
-        }
-        return false;
-    }
-
-    private static List<AutomationElement> FindQuotaContainers(AutomationElement root)
-    {
-        var result = new List<AutomationElement>();
+        var docs = new List<AutomationElement>();
+        var walker = TreeWalker.ControlViewWalker;
         try
         {
-            var cond = new OrCondition(
-                new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Window),
-                new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Menu),
-                new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Pane),
-                new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Group));
-            var all = root.FindAll(TreeScope.Descendants, cond);
-            for (int i = 0; i < all.Count; i++)
+            AutomationElement child = walker.GetFirstChild(root);
+            int guard = 0;
+            while (child != null && guard++ < 16)
             {
                 try
                 {
-                    var el = all[i];
-                    if (el.Current.IsOffscreen) continue;
-                    var ct = el.Current.ControlType;
-                    if (ct == ControlType.Menu)
+                    // Skip owned WPF overlay windows (ControlType.Window); descend only into Electron Chrome Pane/RootView.
+                    if (child.Current.ControlType != ControlType.Window)
                     {
-                        result.Add(el);
-                        continue;
-                    }
-                    string localized = (el.Current.LocalizedControlType ?? "").ToLowerInvariant();
-                    string cls = (el.Current.ClassName ?? "").ToLowerInvariant();
-                    if (localized.Contains("dialog") || localized.Contains("对话框")
-                        || cls.Contains("dialog") || cls.Contains("modal") || cls.Contains("popover") || cls.Contains("popup"))
-                    {
-                        result.Add(el);
+                        var found = child.FindAll(TreeScope.Descendants, new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Document));
+                        for (int i = 0; i < found.Count; i++) docs.Add(found[i]);
                     }
                 }
                 catch { }
+                try { child = walker.GetNextSibling(child); } catch { break; }
             }
         }
         catch { }
-        return result;
+        return docs;
     }
 
-    private static List<string> ExtractShortLines(AutomationElement container, int maxNodes)
+    private bool TryCommitQuotaLines(List<string> lines, string stateDir)
     {
-        var lines = new List<string>();
-        try
+        PoolQuotaState g, c;
+        if (!UiaQuotaParser.TryParseFromLines(lines, DateTime.UtcNow, out g, out c)) return false;
+        DualSlotStore.WriteQuotaFromUia(stateDir, g, c, DateTime.UtcNow);
+        string summary = string.Format("G={0} C={1}",
+            g == null ? "null" : (g.RemainingPct + "%(5h=" + (g.FiveHour != null ? g.FiveHour.RemainingPct.ToString() : "-") + ",7d=" + (g.Weekly != null ? g.Weekly.RemainingPct.ToString() : "-") + ")"),
+            c == null ? "null" : (c.RemainingPct + "%(5h=" + (c.FiveHour != null ? c.FiveHour.RemainingPct.ToString() : "-") + ",7d=" + (c.Weekly != null ? c.Weekly.RemainingPct.ToString() : "-") + ")"));
+        if (summary != _lastSavedQuotaSummary)
         {
-            var nodes = container.FindAll(TreeScope.Descendants, System.Windows.Automation.Condition.TrueCondition);
-            if (nodes.Count > maxNodes) return lines;
-            for (int i = 0; i < nodes.Count; i++)
+            _lastSavedQuotaSummary = summary;
+            Program.Note("quota-uia-saved: " + summary);
+        }
+        return true;
+    }
+
+    private static void CollectLinesFaultTolerant(AutomationElement root, List<string> output, int maxNodes)
+    {
+        var walker = TreeWalker.ControlViewWalker;
+        var stack = new Stack<AutomationElement>();
+        stack.Push(root);
+        int visited = 0;
+        while (stack.Count > 0 && visited < maxNodes)
+        {
+            AutomationElement cur = stack.Pop();
+            visited++;
+            try
             {
-                try
+                string n = cur.Current.Name;
+                if (!string.IsNullOrWhiteSpace(n) && n.Length <= 80)
                 {
-                    string n = nodes[i].Current.Name;
-                    if (string.IsNullOrWhiteSpace(n) || n.Length > 80) continue;
                     foreach (string part in n.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
                     {
                         string t = part.Trim();
-                        if (t.Length > 0 && t.Length <= 48) lines.Add(t);
+                        if (t.Length > 0 && t.Length <= 48) output.Add(t);
                     }
                 }
-                catch { }
             }
+            catch { }
+
+            // Push children in reverse so DFS visits them in exact top-to-bottom visual DOM order.
+            var children = new List<AutomationElement>();
+            try
+            {
+                AutomationElement child = walker.GetFirstChild(cur);
+                int guard = 0;
+                while (child != null && guard++ < 80)
+                {
+                    children.Add(child);
+                    try { child = walker.GetNextSibling(child); } catch { break; }
+                }
+            }
+            catch { }
+            for (int i = children.Count - 1; i >= 0; i--) stack.Push(children[i]);
         }
-        catch { }
-        return lines;
     }
 
     private static AutomationElement FindQuotaDialogScope(AutomationElement root)
