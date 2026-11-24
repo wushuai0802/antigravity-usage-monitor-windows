@@ -113,6 +113,30 @@ internal static class OverlayTests
         Assert(c.FiveHour != null && Math.Abs(c.FiveHour.RemainingPct - 12.0) < 0.01 && c.FiveHour.WindowKind == "5h", "Claude 5h should be 12%");
         Assert(c.Weekly != null && Math.Abs(c.Weekly.RemainingPct - 56.0) < 0.01 && c.Weekly.WindowKind == "7d", "Claude 7d should be 56%");
 
+        // Also verify real model-menu "使用量" popover (including 100% Claude pool without reset line)
+        var popoverLines = new[]
+        {
+            "使用量",
+            "Gemini 模型",
+            "周限额",
+            "99% 剩余",
+            "6 天 16 小时 后重置",
+            "5 小时限额",
+            "99% 剩余",
+            "2 小时 31 分钟 后重置",
+            "Claude 和 GPT 模型",
+            "周限额",
+            "100% 剩余",
+            "5 小时限额",
+            "100% 剩余"
+        };
+        PoolQuotaState pg, pc;
+        bool popOk = UiaQuotaParser.TryParseFromLines(popoverLines, now, out pg, out pc);
+        Assert(popOk && pg != null && pc != null, "Model-menu 使用量 popover should extract both Gemini and 100% Claude pools");
+        Assert(pg.FiveHour != null && Math.Abs(pg.FiveHour.RemainingPct - 99.0) < 0.01, "Popover Gemini 5h should be 99%");
+        Assert(pc.FiveHour != null && Math.Abs(pc.FiveHour.RemainingPct - 100.0) < 0.01 && pc.FiveHour.CountdownText == "满额", "Popover Claude 5h 100% should show 满额");
+        Assert(pc.Weekly != null && Math.Abs(pc.Weekly.RemainingPct - 100.0) < 0.01, "Popover Claude 7d should be 100%");
+
         // Guard: ordinary chat lines mentioning quota keywords and percentages must NOT be misread
         var chatLines = new[]
         {

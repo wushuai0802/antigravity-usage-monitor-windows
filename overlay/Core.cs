@@ -216,7 +216,7 @@ internal static class QuotaEvaluator
         state.WindowKind = "";
         state.Alert = QuotaAlertLevel.None;
         state.AlertHint = "";
-        state.CountdownText = "--";
+        state.CountdownText = (state.RemainingPct >= 99.9) ? "满额" : "--";
 
         if (!resetAtUtc.HasValue) return state;
 
@@ -254,12 +254,12 @@ internal static class QuotaEvaluator
 
 internal static class UiaQuotaParser
 {
-    private static readonly Regex ExactPctRegex = new Regex(@"^\s*(\d{1,3}(?:\.\d+)?)\s*%\s*$", RegexOptions.Compiled);
+    private static readonly Regex ExactPctRegex = new Regex(@"^\s*(\d{1,3}(?:\.\d+)?)\s*%(?:\s*(?:剩余|remaining|left))?\s*$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly Regex RelativeResetRegex = new Regex(
         @"(?:(\d+)\s*(?:d|day|days|天))?\s*(?:(\d+)\s*(?:h|hr|hrs|hour|hours|小时))?\s*(?:(\d+)\s*(?:m|min|mins|minute|minutes|分钟|分))?",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly Regex ExactHeaderRegex = new Regex(
-        @"^(模型额度|model\s+quotas?|models?\s*&\s*(?:quota|usage))$",
+        @"^(模型额度|使用量|usage|model\s+quotas?|models?\s*&\s*(?:quota|usage))$",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly Regex ExactGeminiPoolRegex = new Regex(
         @"^gemini\s*(模型|models?)(?:\s*[^\w\u4e00-\u9fa5]{0,3})?$",
@@ -268,10 +268,10 @@ internal static class UiaQuotaParser
         @"^claude\s*(?:和|and|/|&)\s*(?:gpt|第三方)\s*(模型|models?)?(?:\s*[^\w\u4e00-\u9fa5]{0,3})?$",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly Regex ExactWeeklyRegex = new Regex(
-        @"^(剩余每周限制|每周限制|weekly\s+limit(?:\s+remaining)?|remaining\s+weekly\s+limit)$",
+        @"^(剩余每周限制|每周限制|周限额|weekly\s+limit(?:\s+remaining)?|remaining\s+weekly\s+limit)$",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly Regex ExactFiveHourRegex = new Regex(
-        @"^(剩余五小时限制|剩余\s*5\s*小时限制|五小时限制|5-?hour\s+limit(?:\s+remaining)?|five-?hour\s+limit(?:\s+remaining)?|remaining\s+5-?hour\s+limit)$",
+        @"^(剩余五小时限制|剩余\s*5\s*小时限制|五小时限制|5\s*小时限额|五小时限额|5-?hour\s+limit(?:\s+remaining)?|five-?hour\s+limit(?:\s+remaining)?|remaining\s+5-?hour\s+limit)$",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
     internal static bool TryParseFromLines(IEnumerable<string> lines, DateTime nowUtc, out PoolQuotaState gemini, out PoolQuotaState claude)
@@ -287,7 +287,7 @@ internal static class UiaQuotaParser
         {
             if (string.IsNullOrWhiteSpace(raw)) continue;
             string line = raw.Trim();
-            if (line.Length > 48) continue; // Quota modal labels/values are always short standalone nodes; ignore chat paragraphs.
+            if (line.Length > 48) continue; // Quota modal/popover labels are always short standalone nodes; ignore chat paragraphs.
             list.Add(line);
             if (!hasQuotaHeader && ExactHeaderRegex.IsMatch(line)) hasQuotaHeader = true;
             if (!hasWindowLabel && (ExactWeeklyRegex.IsMatch(line) || ExactFiveHourRegex.IsMatch(line))) hasWindowLabel = true;
@@ -303,7 +303,9 @@ internal static class UiaQuotaParser
 
         Action commitPending = () =>
         {
-            if (string.IsNullOrEmpty(currentPool) || string.IsNullOrEmpty(currentWindow) || !pendingPct.HasValue || !pendingReset.HasValue) return;
+            if (string.IsNullOrEmpty(currentPool) || string.IsNullOrEmpty(currentWindow) || !pendingPct.HasValue) return;
+            // Allow omitted reset time when pool is at 100% (unused window has not started ticking yet).
+            if (!pendingReset.HasValue && pendingPct.Value < 99.9) return;
             PoolQuotaState st = QuotaEvaluator.Evaluate(currentPool, pendingPct.Value, pendingReset, nowUtc);
             st.WindowKind = currentWindow;
             if (currentWindow == "7d")
