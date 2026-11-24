@@ -425,8 +425,10 @@ internal sealed class AnchorFinder
             new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.ListItem));
         var nodes = scopeRoot.FindAll(TreeScope.Descendants, cond);
         var lines = new List<string>();
-        int limit = Math.Min(nodes.Count, 2600);
-        for (int i = 0; i < limit; i++)
+        // React/Base-UI portals (settings modals and Usage popovers) always mount at the tail of the DOM tree.
+        // Scanning the last 600 nodes skips thousands of earlier chat-transcript text nodes and never truncates the modal tail.
+        int start = includeOffscreen ? 0 : Math.Max(0, nodes.Count - 600);
+        for (int i = start; i < nodes.Count; i++)
         {
             try
             {
@@ -446,16 +448,12 @@ internal sealed class AnchorFinder
         if (UiaQuotaParser.TryParseFromLines(lines, DateTime.UtcNow, out g, out c))
         {
             DualSlotStore.WriteQuotaFromUia(stateDir, g, c, DateTime.UtcNow);
-            return true;
-        }
-        if (logMiss)
-        {
-            int anchorIdx = lines.FindIndex(l => l == "使用量" || l == "模型额度" || l.Equals("Usage", StringComparison.OrdinalIgnoreCase));
-            if (anchorIdx >= 0)
+            if (g != null && c == null)
             {
-                var snippet = lines.Skip(anchorIdx).Take(20).ToArray();
-                Program.Note("quota-scan-miss: " + string.Join(" | ", snippet));
+                int idx = lines.FindLastIndex(l => l.IndexOf("Gemini", StringComparison.OrdinalIgnoreCase) >= 0);
+                if (idx >= 0) Program.Note("quota-partial-tail: " + string.Join(" | ", lines.Skip(idx).Take(25).ToArray()));
             }
+            return true;
         }
         return false;
     }
