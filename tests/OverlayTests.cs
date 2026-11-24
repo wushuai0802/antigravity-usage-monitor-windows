@@ -218,6 +218,19 @@ internal static class OverlayTests
         Assert(ec.Weekly != null && Math.Abs(ec.Weekly.RemainingPct - 100.0) < 0.01 && ec.Weekly.CountdownText == "满额", "Exact Claude 7d should be 100%");
         Assert(ec.FiveHour != null && Math.Abs(ec.FiveHour.RemainingPct - 100.0) < 0.01 && ec.FiveHour.CountdownText == "满额", "Exact Claude 5h should be 100%");
 
+        // Verify exact FromPoint RawView capture with "正在刷新..." and hour-only reset "1 小时 后重置"
+        var refreshingLines = new[]
+        {
+            "查看用量", "使用量", "正在刷新...",
+            "Gemini 模型", "周限额", "91", "% 剩余", "6 天 15 小时 后重置",
+            "5 小时限额", "64", "% 剩余", "1 小时 后重置",
+            "Claude 和 GPT 模型", "周限额", "100", "% 剩余", "5 小时限额", "100", "% 剩余"
+        };
+        PoolQuotaState rg, rc;
+        bool rOk = UiaQuotaParser.TryParseFromLines(refreshingLines, now, out rg, out rc);
+        Assert(rOk && rg != null && rc != null, "Refreshing submenu with hour-only reset must parse both pools");
+        Assert(rg.FiveHour != null && Math.Abs(rg.FiveHour.RemainingPct - 64.0) < 0.01 && rg.FiveHour.ResetAtUtc.HasValue, "Hour-only reset '1 小时 后重置' must parse");
+
         // Guard: ordinary chat lines mentioning quota keywords and percentages must NOT be misread
         var chatLines = new[]
         {

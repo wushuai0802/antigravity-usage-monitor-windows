@@ -25,6 +25,9 @@ internal static class Native
     [StructLayout(LayoutKind.Sequential)]
     internal struct POINT { public int X, Y; public POINT(int x, int y) { X = x; Y = y; } }
 
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct LASTINPUTINFO { public uint cbSize; public uint dwTime; }
+
     internal delegate bool EnumProc(IntPtr window, IntPtr state);
 
     [DllImport("user32.dll")] internal static extern bool EnumWindows(EnumProc callback, IntPtr state);
@@ -48,6 +51,18 @@ internal static class Native
     [DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW")] internal static extern IntPtr GetLong(IntPtr window, int index);
     [DllImport("user32.dll")] internal static extern bool SetWindowPos(IntPtr window, IntPtr after, int x, int y, int width, int height, uint flags);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] internal static extern int GetWindowText(IntPtr window, StringBuilder text, int maxCount);
+    [DllImport("user32.dll")] internal static extern bool GetLastInputInfo(ref LASTINPUTINFO info);
+    [DllImport("user32.dll")] internal static extern bool ScreenToClient(IntPtr hWnd, ref POINT lpPoint);
+    [DllImport("user32.dll")] internal static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] internal static extern IntPtr FindWindowEx(IntPtr parent, IntPtr after, string cls, string title);
+
+    internal static double IdleSeconds()
+    {
+        var lii = new LASTINPUTINFO { cbSize = (uint)Marshal.SizeOf(typeof(LASTINPUTINFO)) };
+        if (!GetLastInputInfo(ref lii)) return 0.0;
+        uint elapsedMs = unchecked((uint)Environment.TickCount - lii.dwTime);
+        return elapsedMs / 1000.0;
+    }
 
     internal static bool Live(IntPtr w) { return w != IntPtr.Zero && IsWindow(w) && IsWindowVisible(w) && !IsIconic(w); }
     internal static double Scale(IntPtr w) { try { return Math.Max(1.0, GetDpiForWindow(w) / 96.0); } catch (EntryPointNotFoundException) { return 1.0; } }
@@ -388,6 +403,12 @@ internal sealed class AnchorFinder
         TryOpportunisticQuotaScan(_webDoc, window, stateDir, false);
     }
 
+    private static readonly System.Windows.Automation.Condition UsageMenuItemCondition = new AndCondition(
+        new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.MenuItem),
+        new OrCondition(
+            new PropertyCondition(AutomationElement.NameProperty, "查看用量"),
+            new PropertyCondition(AutomationElement.NameProperty, "View usage"),
+            new PropertyCondition(AutomationElement.NameProperty, "Usage")));
     private static readonly System.Windows.Automation.Condition UsageMenuCondition = new AndCondition(
         new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Menu),
         new OrCondition(
@@ -395,6 +416,74 @@ internal sealed class AnchorFinder
             new PropertyCondition(AutomationElement.NameProperty, "使用量"),
             new PropertyCondition(AutomationElement.NameProperty, "View usage"),
             new PropertyCondition(AutomationElement.NameProperty, "Usage")));
+
+    // Zero-cursor-move UIA quota sync: Expand model picker -> post WM_MOUSEMOVE over "查看用量" -> read RawView -> Collapse.
+    internal bool TriggerQuotaRefresh(IntPtr window, string stateDir)
+    {
+        if (!Native.Live(window) || string.IsNullOrEmpty(stateDir)) return false;
+        try
+        {
+            if (window != _window || _modelButton == null || _webDoc == null)
+            {
+                _window = window;
+                Search(window, stateDir);
+            }
+            if (_modelButton == null || _webDoc == null || _modelButton.Current.IsOffscreen) return false;
+
+            object patObj;
+            if (!_modelButton.TryGetCurrentPattern(ExpandCollapsePattern.Pattern, out patObj)) return false;
+            var ep = (ExpandCollapsePattern)patObj;
+            if (ep.Current.ExpandCollapseState == ExpandCollapseState.Expanded) return false; // User already has menu open
+
+            ep.Expand();
+            try
+            {
+                System.Threading.Thread.Sleep(160);
+                var usageItem = _webDoc.FindFirst(TreeScope.Descendants, UsageMenuItemCondition);
+                if (usageItem == null) return false;
+
+                Rect r = usageItem.Current.BoundingRectangle;
+                if (r.IsEmpty || r.Width <= 0 || r.Height <= 0) return false;
+
+                // Post WM_MOUSEMOVE directly to the Electron window without moving the user's actual mouse cursor.
+                IntPtr renderHwnd = Native.FindWindowEx(window, IntPtr.Zero, "Chrome_RenderWidgetHostHWND", null);
+                IntPtr targetHwnd = renderHwnd != IntPtr.Zero ? renderHwnd : window;
+                var pt = new Native.POINT((int)(r.X + r.Width / 2.0), (int)(r.Y + r.Height / 2.0));
+                Native.ScreenToClient(targetHwnd, ref pt);
+                IntPtr lparam = new IntPtr(((pt.Y & 0xFFFF) << 16) | (pt.X & 0xFFFF));
+                Native.PostMessage(targetHwnd, 0x0200, IntPtr.Zero, lparam);
+
+                // Wait for submenu mount and fresh values (finish early as soon as "正在刷新" clears).
+                List<string> bestLines = null;
+                for (int t = 0; t < 15; t++)
+                {
+                    System.Threading.Thread.Sleep(120);
+                    var usageMenu = _webDoc.FindFirst(TreeScope.Descendants, UsageMenuCondition);
+                    if (usageMenu == null) continue;
+
+                    var lines = new List<string>();
+                    CollectLinesFaultTolerant(usageMenu, lines, 120, true);
+                    PoolQuotaState g, c;
+                    if (UiaQuotaParser.TryParseFromLines(lines, DateTime.UtcNow, out g, out c))
+                    {
+                        bestLines = lines;
+                        bool stillRefreshing = lines.Any(l => l.Contains("正在刷新") || l.IndexOf("refreshing", StringComparison.OrdinalIgnoreCase) >= 0);
+                        if (!stillRefreshing && t >= 2) break;
+                    }
+                }
+                if (bestLines != null)
+                {
+                    return TryCommitQuotaLines(bestLines, stateDir);
+                }
+            }
+            finally
+            {
+                try { ep.Collapse(); } catch { }
+            }
+        }
+        catch (Exception ex) { Program.Note("quota-auto-refresh-err: " + ex.GetType().Name); }
+        return false;
+    }
     private static readonly System.Windows.Automation.Condition ModalAnchorCondition = new OrCondition(
         new PropertyCondition(AutomationElement.NameProperty, "剩余五小时限制"),
         new PropertyCondition(AutomationElement.NameProperty, "剩余每周限制"),

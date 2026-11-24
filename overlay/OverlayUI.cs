@@ -224,6 +224,7 @@ internal sealed class OverlayController
     private readonly string _stateDir;
     private readonly string _settingsPath;
     private readonly Action _requestRefresh;
+    private readonly Action _requestQuotaRefresh;
     private readonly Dispatcher _dispatcher;
     private readonly PassiveWindow _strip;
     private readonly PassiveWindow _panel;
@@ -236,19 +237,25 @@ internal sealed class OverlayController
     private DateTime _stableAt = DateTime.MinValue;
     private string _hiddenSignature = "";
     private string _hostSignature = "";
-    private bool _panelOpen;
+    private volatile bool _panelOpen;
     private bool _settingsTab;
     private bool _hoverStrip;
     private bool _lightTheme;
 
     internal volatile bool IsMoving;
+    internal bool IsPanelOpen { get { return _panelOpen; } }
+    internal volatile bool AutoRefreshQuotaEnabled;
+    internal volatile int AutoRefreshIntervalMinutes;
 
-    internal OverlayController(string stateDir, Action requestRefresh)
+    internal OverlayController(string stateDir, Action requestRefresh, Action requestQuotaRefresh)
     {
         _stateDir = stateDir;
         _settingsPath = Path.Combine(stateDir, "settings.json");
         _requestRefresh = requestRefresh;
+        _requestQuotaRefresh = requestQuotaRefresh;
         _settings = OverlaySettings.Load(_settingsPath);
+        AutoRefreshQuotaEnabled = _settings.AutoRefreshQuota;
+        AutoRefreshIntervalMinutes = _settings.AutoRefreshIntervalMinutes;
         _dispatcher = Dispatcher.CurrentDispatcher;
 
         _strip = new PassiveWindow("Antigravity Usage Strip");
@@ -466,12 +473,15 @@ internal sealed class OverlayController
     private void ShowContextMenu()
     {
         var menu = new ContextMenu();
-        var refresh = new MenuItem { Header = "立即刷新本地统计" };
+        var refreshQuota = new MenuItem { Header = "刷新双池配额" };
+        refreshQuota.Click += (s, e) => { _panelOpen = false; _panel.Hide(); if (_requestQuotaRefresh != null) _requestQuotaRefresh(); };
+        var refresh = new MenuItem { Header = "刷新本地统计" };
         refresh.Click += (s, e) => { if (_requestRefresh != null) _requestRefresh(); };
         var hideRun = new MenuItem { Header = "本次运行暂时隐藏" };
         hideRun.Click += (s, e) => { _hiddenSignature = _hostSignature; _panelOpen = false; _strip.Hide(); _panel.Hide(); };
         var quit = new MenuItem { Header = "退出 Antigravity Usage Monitor" };
         quit.Click += (s, e) => Application.Current.Shutdown();
+        menu.Items.Add(refreshQuota);
         menu.Items.Add(refresh);
         menu.Items.Add(hideRun);
         menu.Items.Add(new Separator());
@@ -499,8 +509,18 @@ internal sealed class OverlayController
             _settingsTab = !_settingsTab;
             RenderAndPlace();
         });
+        var refreshBtn = MakeSmallButton("刷新额度", pal, () =>
+        {
+            _panelOpen = false;
+            _settingsTab = false;
+            _panel.Hide();
+            if (_requestQuotaRefresh != null) _requestQuotaRefresh();
+        });
+        refreshBtn.Margin = new Thickness(0, 0, 6, 0);
         DockPanel.SetDock(tabBtn, Dock.Right);
+        DockPanel.SetDock(refreshBtn, Dock.Right);
         header.Children.Add(tabBtn);
+        header.Children.Add(refreshBtn);
         header.Children.Add(titleBlock);
         rootStack.Children.Add(header);
 
@@ -681,6 +701,41 @@ internal sealed class OverlayController
             themeRow.Children.Add(btn);
         }
         sp.Children.Add(themeRow);
+
+        sp.Children.Add(SectionHeading("双池配额自动同步（不移动鼠标，键鼠空闲 ≥ 45s 后快闪读取）", pal));
+        var autoCb = new CheckBox
+        {
+            Content = "启用空闲自动刷新双池配额",
+            IsChecked = _settings.AutoRefreshQuota,
+            Foreground = pal.InkPrimary,
+            FontFamily = UiFont,
+            FontSize = 12,
+            Margin = new Thickness(0, 2, 0, 6)
+        };
+        autoCb.Click += (s, e) =>
+        {
+            _settings.AutoRefreshQuota = autoCb.IsChecked == true;
+            AutoRefreshQuotaEnabled = _settings.AutoRefreshQuota;
+            _settings.Save(_settingsPath);
+            RenderAndPlace();
+        };
+        sp.Children.Add(autoCb);
+
+        var intervalRow = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 0, 0, 10) };
+        foreach (int mins in new[] { 5, 10, 20 })
+        {
+            int mv = mins;
+            var ibtn = MakeSmallButton((_settings.AutoRefreshIntervalMinutes == mv ? "● " : "") + mv + " 分钟", pal, () =>
+            {
+                _settings.AutoRefreshIntervalMinutes = mv;
+                AutoRefreshIntervalMinutes = mv;
+                _settings.Save(_settingsPath);
+                RenderAndPlace();
+            });
+            ibtn.Margin = new Thickness(0, 0, 8, 0);
+            intervalRow.Children.Add(ibtn);
+        }
+        sp.Children.Add(intervalRow);
 
         sp.Children.Add(SectionHeading("折叠条显示项与窄窗口保留顺序（越靠上越优先保留）", pal));
         var names = new Dictionary<string, string>

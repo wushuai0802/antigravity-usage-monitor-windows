@@ -55,12 +55,15 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
 
 ---
 
-## 双池配额同步（可选增强）
+## 双池配额同步
 
-Antigravity App 的 Hook 载荷目前不包含云端剩余配额，本工具采用**双路零侵入同步**写入标准双槽文件 `quota.slot{0,1}.json`：
+Antigravity App 的 Hook 载荷目前不包含云端剩余配额，本工具采用**纯官方 UIA 无感读取 + 可选 CLI 旁路**写入标准双槽文件：
 
-1. **桌面端 UIA 顺手拾取（默认开启，零网络）**：当你在 Antigravity 桌面端打开展示配额的设置/模型面板时，浮层从可见 UIA 文本中只读解析双池百分比与重置时间并缓存，关闭页面后持续本地倒计时。
-2. **`agy` CLI `statusLine` 旁路同步（可选）**：在 `~/.gemini/antigravity-cli/settings.json` 中配置 `statusLine` 指向 `hooks/statusline-sync.py`，每次使用 `agy` 时会自动把官方 JSON 里的 `quota` 字段同步到桌面浮层（不改变正常终端输出）。
+1. **桌面端自动 & 一键刷新（默认开启，零凭据、零 Token、不移动鼠标）**：
+   - **手动随时刷新**：点击展开面板右上角「刷新额度」或右键状态条选择「刷新双池配额」，通过原生 UIA `ExpandCollapsePattern` + 无光标移动 `WM_MOUSEMOVE` 读取模型菜单「查看用量」子浮卡中的 **Gemini（5h + 7d）与 Claude / GPT（5h + 7d）** 四条配额并立即收起（约 0.7 秒）。
+   - **空闲自动刷新**：在「显示设置」中可开关与调整周期（5 / 10 / 20 分钟）。仅当键鼠连续空闲 ≥ 45 秒、无菜单展开、且达到周期或新增消耗 ≥ 300 万 Token 时才自动快闪同步，绝不打断输入。
+   - **顺手被动拾取**：平时自己滑开模型菜单「查看用量」或打开「模型额度」页时也会即时同步最新数值。
+2. **`agy` CLI `statusLine` 旁路同步（可选）**：在 `~/.gemini/antigravity-cli/settings.json` 中配置 `statusLine` 指向 `hooks/statusline-sync.py`，每次使用 `agy` 时会自动把官方 JSON 里的 `quota` 字段同步到桌面浮层。
 
 详细数据结构见 [架构与数据契约](docs/architecture.md)。
 

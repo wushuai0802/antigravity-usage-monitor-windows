@@ -125,7 +125,11 @@ internal static class Program
             app.Exit += (s, e) => StopEvent.Set();
 
             var refreshFlag = new ManualResetEvent(false);
-            var controller = new OverlayController(_stateDir, () => refreshFlag.Set());
+            var quotaRefreshFlag = new ManualResetEvent(false);
+            long latestTodayTokens = 0;
+            long lastQuotaTokens = 0;
+            long lastQuotaUpdatedTicks = 0;
+            var controller = new OverlayController(_stateDir, () => refreshFlag.Set(), () => quotaRefreshFlag.Set());
 
             // 1. Track Antigravity host process & active main window
             Worker(() =>
@@ -147,18 +151,61 @@ internal static class Program
                 }
             });
 
-            // 2. Track UIA composer toolbar anchor & opportunistic quota scan
+            // 2. Track UIA composer toolbar anchor, passive quota capture, and safe auto/manual quota refresh
             Worker(() =>
             {
                 var finder = new AnchorFinder();
+                DateTime lastAutoAttempt = DateTime.MinValue;
                 while (!StopEvent.WaitOne(0))
                 {
                     try
                     {
                         IntPtr w = Interlocked.CompareExchange(ref _window, IntPtr.Zero, IntPtr.Zero);
+                        bool manualQuota = quotaRefreshFlag.WaitOne(0);
+                        if (manualQuota)
+                        {
+                            quotaRefreshFlag.Reset();
+                            if (w != IntPtr.Zero && !controller.IsMoving)
+                            {
+                                lastAutoAttempt = DateTime.UtcNow;
+                                if (finder.TriggerQuotaRefresh(w, _stateDir))
+                                {
+                                    Interlocked.Exchange(ref lastQuotaTokens, Interlocked.Read(ref latestTodayTokens));
+                                }
+                            }
+                        }
+
+                        Anchor anchor = null;
                         if (!controller.IsMoving)
                         {
-                            controller.PostAnchor(w == IntPtr.Zero ? null : finder.Find(w, _stateDir));
+                            anchor = w == IntPtr.Zero ? null : finder.Find(w, _stateDir);
+                            controller.PostAnchor(anchor);
+                        }
+
+                        // Guarded idle auto-refresh: only when enabled, user idle >= 45s, no menu/panel open,
+                        // and either interval elapsed or >= 3M new tokens consumed since last quota sync.
+                        if (anchor != null && !anchor.MenuOpen && !controller.IsMoving && !controller.IsPanelOpen
+                            && controller.AutoRefreshQuotaEnabled && Native.IdleSeconds() >= 45.0
+                            && (DateTime.UtcNow - lastAutoAttempt).TotalSeconds >= 90.0)
+                        {
+                            long qTicks = Interlocked.Read(ref lastQuotaUpdatedTicks);
+                            DateTime lastQuotaUtc = qTicks > 0 ? new DateTime(qTicks, DateTimeKind.Utc) : DateTime.MinValue;
+                            double ageMin = (DateTime.UtcNow - lastQuotaUtc).TotalMinutes;
+                            long curTok = Interlocked.Read(ref latestTodayTokens);
+                            long prevTok = Interlocked.Read(ref lastQuotaTokens);
+                            int intervalMin = Math.Max(2, controller.AutoRefreshIntervalMinutes);
+                            bool dueByTime = (qTicks == 0) || ageMin >= intervalMin;
+                            bool dueByBurn = (curTok - prevTok) >= 3000000L && ageMin >= 2.0;
+
+                            if (dueByTime || dueByBurn)
+                            {
+                                lastAutoAttempt = DateTime.UtcNow;
+                                if (finder.TriggerQuotaRefresh(w, _stateDir))
+                                {
+                                    Interlocked.Exchange(ref lastQuotaTokens, curTok);
+                                    Interlocked.Exchange(ref lastQuotaUpdatedTicks, DateTime.UtcNow.Ticks);
+                                }
+                            }
                         }
                     }
                     catch (Exception ex) { Note("locating: " + ex.GetType().Name); }
@@ -196,6 +243,8 @@ internal static class Program
                             failStreak = ok ? 0 : (failStreak + 1);
                             snap = DualSlotStore.LoadSnapshot(_stateDir, DateTime.UtcNow);
                         }
+                        if (snap.Today != null) Interlocked.Exchange(ref latestTodayTokens, snap.Today.TotalTokens);
+                        if (snap.Quota != null) Interlocked.Exchange(ref lastQuotaUpdatedTicks, snap.Quota.UpdatedAtUtc.Ticks);
                         controller.PostSnapshot(snap);
                     }
                     catch (Exception ex) { Note("polling: " + ex.GetType().Name); }

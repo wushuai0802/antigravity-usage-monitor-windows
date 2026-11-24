@@ -134,6 +134,8 @@ internal sealed class OverlaySettings
     internal string ThemeMode; // "auto", "dark", "light"
     internal Dictionary<string, bool> Visible;
     internal List<string> Priority;
+    internal bool AutoRefreshQuota;
+    internal int AutoRefreshIntervalMinutes;
 
     internal static OverlaySettings CreateDefault()
     {
@@ -142,6 +144,8 @@ internal sealed class OverlaySettings
         s.Visible = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
         foreach (string k in AllItems) s.Visible[k] = true;
         s.Priority = new List<string>(DefaultPriority);
+        s.AutoRefreshQuota = true;
+        s.AutoRefreshIntervalMinutes = 10;
         return s;
     }
 
@@ -159,6 +163,20 @@ internal sealed class OverlaySettings
             {
                 string tm = ((string)themeObj).ToLowerInvariant();
                 if (tm == "auto" || tm == "dark" || tm == "light") def.ThemeMode = tm;
+            }
+            object autoObj;
+            if (raw.TryGetValue("autoRefreshQuota", out autoObj) && autoObj is bool)
+            {
+                def.AutoRefreshQuota = (bool)autoObj;
+            }
+            object intObj;
+            if (raw.TryGetValue("autoRefreshIntervalMinutes", out intObj) && intObj != null)
+            {
+                int mins;
+                if (int.TryParse(Convert.ToString(intObj, CultureInfo.InvariantCulture), out mins) && mins >= 2 && mins <= 120)
+                {
+                    def.AutoRefreshIntervalMinutes = mins;
+                }
             }
             object visObj;
             if (raw.TryGetValue("visible", out visObj) && visObj is Dictionary<string, object>)
@@ -196,6 +214,8 @@ internal sealed class OverlaySettings
             var payload = new Dictionary<string, object>
             {
                 { "themeMode", ThemeMode },
+                { "autoRefreshQuota", AutoRefreshQuota },
+                { "autoRefreshIntervalMinutes", AutoRefreshIntervalMinutes },
                 { "visible", Visible },
                 { "priority", Priority.ToArray() }
             };
