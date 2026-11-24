@@ -1,0 +1,151 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Windows;
+
+internal static class OverlayTests
+{
+    private static int _passed;
+
+    private static void Assert(bool cond, string message)
+    {
+        if (!cond) throw new Exception("ASSERT FAILED: " + message);
+        _passed++;
+    }
+
+    [STAThread]
+    public static int Main(string[] args)
+    {
+        TestFreeRangeAfterModel();
+        TestQuotaWindowAndAlerts();
+        TestWindowTitleSessionMatch();
+        TestUiaQuotaParser();
+        TestNarrowPriorityTrim();
+        TestDualSlotQuotaRoundTrip();
+        Console.WriteLine("C# OverlayTests passed: " + _passed + " assertions.");
+        return 0;
+    }
+
+    private static void TestFreeRangeAfterModel()
+    {
+        // Mirrors real Antigravity 2.0 UIA geometry:
+        // Input row: X=874..1633, Model button: X=904..1047, Permission button: X=1452..1567
+        var row = new Rect(874, 1080, 759, 28);
+        var model = new Rect(904, 1080, 143, 28);
+        var others = new[]
+        {
+            new Rect(876, 1080, 29, 28),
+            new Rect(1452, 1080, 115, 28),
+            new Rect(1568, 1080, 29, 28),
+            new Rect(1602, 1080, 29, 28)
+        };
+        Rect free = OverlayLayout.FreeRangeAfterModel(row, model, others, 1.0);
+        Assert(!free.IsEmpty, "FreeRangeAfterModel should locate gap between model and permission button");
+        Assert(free.Left >= 1052 && free.Right <= 1447, "Gap should respect 6px control margins");
+        Assert(free.Width >= 385, "Gap width should be ~393px");
+
+        Rect placed = OverlayLayout.PlaceInRange(free.Left, free.Right, free.Top, 300, 24, 1.0);
+        Assert(!placed.IsEmpty && placed.Width == 300, "Strip should fit inside gap");
+        Rect tooWide = OverlayLayout.PlaceInRange(free.Left, free.Right, free.Top, 500, 24, 1.0);
+        Assert(tooWide.IsEmpty, "Oversized strip should refuse placement");
+    }
+
+    private static void TestQuotaWindowAndAlerts()
+    {
+        var now = new DateTime(2026, 11, 24, 3, 0, 0, DateTimeKind.Utc);
+        var q5hWarn = QuotaEvaluator.Evaluate("claude", 9.5, now.AddHours(3), now);
+        Assert(q5hWarn.WindowKind == "5h", "3h reset must classify as 5h window");
+        Assert(q5hWarn.Alert == QuotaAlertLevel.Warn5h, "9.5% in 5h must warn");
+
+        var q5hOk = QuotaEvaluator.Evaluate("gemini", 25.0, now.AddHours(3), now);
+        Assert(q5hOk.WindowKind == "5h" && q5hOk.Alert == QuotaAlertLevel.None, "25% in 5h should be normal");
+
+        var q7dCrit = QuotaEvaluator.Evaluate("gemini", 4.0, now.AddDays(3), now);
+        Assert(q7dCrit.WindowKind == "7d", ">6h reset must classify as 7d window");
+        Assert(q7dCrit.Alert == QuotaAlertLevel.Critical7d, "4% in 7d must trigger critical alert");
+
+        var qPassed = QuotaEvaluator.Evaluate("gemini", 0.0, now.AddMinutes(-5), now);
+        Assert(qPassed.Alert == QuotaAlertLevel.ResetPassed && qPassed.CountdownText == "已重置", "Past reset must display 已重置");
+    }
+
+    private static void TestWindowTitleSessionMatch()
+    {
+        var sessions = new Dictionary<string, SessionStats>(StringComparer.OrdinalIgnoreCase)
+        {
+            { "id-1", new SessionStats { ConversationId = "id-1", Title = "Antigravity Usage Monitor Development Ideas", LastModifiedUtc = DateTime.UtcNow } },
+            { "id-2", new SessionStats { ConversationId = "id-2", Title = "Other Task", LastModifiedUtc = DateTime.UtcNow.AddMinutes(-10) } }
+        };
+        var matched = MonitorSnapshot.MatchSessionByWindowTitle("Antigravity - 电脑 - Antigravity Usage... (WSL: Ubuntu)", sessions);
+        Assert(matched != null && matched.ConversationId == "id-1", "Window title prefix should match active session");
+        Assert(AnchorFinder.ExtractModelName("Select model, current: Gemini 4 Neon High") == "Gemini 4 Neon High", "Should extract model name from UIA button label");
+    }
+
+    private static void TestUiaQuotaParser()
+    {
+        var now = new DateTime(2026, 11, 24, 3, 0, 0, DateTimeKind.Utc);
+        var lines = new[]
+        {
+            "Models & Quotas",
+            "Gemini models",
+            "25% remaining",
+            "Resets in 3h 15m",
+            "Claude and GPT models",
+            "12% remaining",
+            "Resets in 4h 0m",
+            "Context window: 85% used"
+        };
+        PoolQuotaState g, c;
+        bool ok = UiaQuotaParser.TryParseFromLines(lines, now, out g, out c);
+        Assert(ok && g != null && c != null, "UIA parser should extract both pools");
+        Assert(Math.Abs(g.RemainingPct - 25.0) < 0.01 && g.WindowKind == "5h", "Gemini pool should be 25% 5h");
+        Assert(Math.Abs(c.RemainingPct - 12.0) < 0.01 && c.WindowKind == "5h", "Claude pool should be 12% 5h");
+
+        // Guard: ordinary chat lines mentioning percentages must NOT be misread as quota
+        var chatLines = new[]
+        {
+            "Gemini 25% remaining",
+            "Claude 12% remaining"
+        };
+        PoolQuotaState g2, c2;
+        bool chatOk = UiaQuotaParser.TryParseFromLines(chatLines, now, out g2, out c2);
+        Assert(!chatOk && g2 == null && c2 == null, "Chat prose without quota panel heading & reset time must be rejected");
+    }
+
+    private static void TestNarrowPriorityTrim()
+    {
+        var pal = ThemePalette.For(false);
+        var items = new List<StripItem>
+        {
+            new StripItem { Key = "rate", Text = "48.2 tok/s", Ink = pal.InkPrimary },
+            new StripItem { Key = "today", Text = "184.5万", Ink = pal.InkMuted },
+            new StripItem { Key = "cache", Text = "84.6%", Ink = pal.InkMuted },
+            new StripItem { Key = "quota", Text = "G 25% · C 12%", Ink = pal.InkPrimary },
+            new StripItem { Key = "context", Text = "上下文 14%", Ink = pal.InkMuted }
+        };
+        var priority = new List<string> { "rate", "quota", "context", "today", "cache" };
+        // Fake width: each item costs 80 dip
+        var trimmed = StripBuilder.FitToWidth(items, priority, 250, list => list.Count * 80.0);
+        Assert(trimmed.Count == 3, "Should trim down to 3 highest-priority items");
+        Assert(trimmed[0].Key == "rate" && trimmed[1].Key == "quota" && trimmed[2].Key == "context", "Should drop cache & today while keeping visual order");
+    }
+
+    private static void TestDualSlotQuotaRoundTrip()
+    {
+        string tmp = Path.Combine(Path.GetTempPath(), "agy-monitor-test-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            var now = new DateTime(2026, 11, 24, 3, 0, 0, DateTimeKind.Utc);
+            var g = QuotaEvaluator.Evaluate("gemini", 25.0, now.AddHours(3), now);
+            var c = QuotaEvaluator.Evaluate("claude", 12.0, now.AddHours(3), now);
+            DualSlotStore.WriteQuotaFromUia(tmp, g, c, now);
+            var snap = DualSlotStore.LoadSnapshot(tmp, now);
+            Assert(snap.Quota != null && snap.Quota.Gemini != null && snap.Quota.Claude != null, "Should reload dual-slot quota snapshot");
+            Assert(MetricFormatter.FormatCompactQuota(snap.Quota, "gemini") == "G 25% · C 12%", "Gemini active should place G first");
+            Assert(MetricFormatter.FormatCompactQuota(snap.Quota, "claude") == "C 12% · G 25%", "Claude active should place C first");
+        }
+        finally
+        {
+            if (Directory.Exists(tmp)) Directory.Delete(tmp, true);
+        }
+    }
+}

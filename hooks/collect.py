@@ -743,7 +743,12 @@ def main(argv: list[str] | None = None) -> int:
         if args.scan_only:
             timing = load_timing_state(state_dir)
             snapshot = collect_snapshot(app_data_dir, state_dir, now_utc=now_utc, timing=timing)
-            write_dual_slot(state_dir, "metrics", snapshot)
+            _, existing = read_latest_slot(state_dir, "metrics")
+            has_new_data = bool(snapshot.get("sessions")) or snapshot.get("today", {}).get("totalTokens", 0) > 0
+            has_old_data = isinstance(existing, dict) and (bool(existing.get("sessions")) or existing.get("today", {}).get("totalTokens", 0) > 0)
+            # Never overwrite a populated snapshot with an empty scan (e.g., wrong-side fallback).
+            if has_new_data or not has_old_data:
+                write_dual_slot(state_dir, "metrics", snapshot)
         elif args.event:
             handle_hook_event(
                 args.event,
