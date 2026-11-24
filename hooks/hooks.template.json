@@ -1,0 +1,33 @@
+{
+  "antigravity-usage-monitor": {
+    "enabled": true,
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "python3 \"{{COLLECT_SCRIPT}}\" --event SessionStart",
+        "timeout": 8
+      }
+    ],
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "python3 \"{{COLLECT_SCRIPT}}\" --event PreInvocation",
+        "timeout": 5
+      }
+    ],
+    "PostInvocation": [
+      {
+        "type": "command",
+        "command": "python3 \"{{COLLECT_SCRIPT}}\" --event PostInvocation",
+        "timeout": 8
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "python3 \"{{COLLECT_SCRIPT}}\" --event Stop",
+        "timeout": 8
+      }
+    ]
+  }
+}
