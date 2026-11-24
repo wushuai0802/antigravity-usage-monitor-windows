@@ -424,15 +424,15 @@ internal sealed class AnchorFinder
             }
             if (visibleAnchors.Count == 0) return;
 
-            // Climb via geometry ONLY (zero nested FindAll calls!) to locate the enclosing popover/modal card,
-            // then run CollectLinesFaultTolerant at most once per candidate container.
+            // Climb via geometry ONLY (zero nested FindAll calls!) and keep candidates SMALLEST-FIRST
+            // so the tight popover/modal card is scanned before any outer chat wrapper!
             var walker = TreeWalker.ControlViewWalker;
             var candidates = new List<AutomationElement>();
             foreach (var anchor in visibleAnchors)
             {
                 AutomationElement cur = anchor;
-                AutomationElement bestCard = null;
-                for (int d = 0; d < 12 && cur != null; d++)
+                int addedForAnchor = 0;
+                for (int d = 0; d < 12 && cur != null && addedForAnchor < 4; d++)
                 {
                     if (cur == webDoc) break;
                     try
@@ -440,16 +440,19 @@ internal sealed class AnchorFinder
                         string aid = cur.Current.AutomationId ?? "";
                         if (string.Equals(aid, "root", StringComparison.OrdinalIgnoreCase)) break;
                         Rect r = cur.Current.BoundingRectangle;
-                        if (!r.IsEmpty && r.Width >= 220 * scale && r.Height >= 160 * scale
-                            && r.Width <= frame.Width * 0.94 && r.Height <= frame.Height * 0.94)
+                        if (!r.IsEmpty && r.Width >= 220 * scale && r.Height >= 150 * scale
+                            && r.Width <= frame.Width * 0.92 && r.Height <= frame.Height * 0.92)
                         {
-                            bestCard = cur;
+                            if (!candidates.Contains(cur))
+                            {
+                                candidates.Add(cur);
+                                addedForAnchor++;
+                            }
                         }
                     }
                     catch { break; }
                     try { cur = walker.GetParent(cur); } catch { break; }
                 }
-                if (bestCard != null && !candidates.Contains(bestCard)) candidates.Add(bestCard);
             }
 
             PoolQuotaState bestG = null, bestC = null;
