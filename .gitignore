@@ -1,0 +1,18 @@
+# Build outputs & local runtime state
+*.exe
+*.pdb
+*.new
+*.previous
+*.log
+work/
+dist/
+out/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Local private configs
+*.local.json
+.env
+.DS_Store
+Thumbs.db
