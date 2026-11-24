@@ -296,6 +296,8 @@ internal static class UiaQuotaParser
         var list = new List<string>();
         bool hasQuotaHeader = false;
         bool hasWindowLabel = false;
+        bool hasGeminiPool = false;
+        bool hasClaudePool = false;
         foreach (string raw in lines)
         {
             if (string.IsNullOrWhiteSpace(raw)) continue;
@@ -304,9 +306,11 @@ internal static class UiaQuotaParser
             list.Add(line);
             if (!hasQuotaHeader && ExactHeaderRegex.IsMatch(line)) hasQuotaHeader = true;
             if (!hasWindowLabel && (ExactWeeklyRegex.IsMatch(line) || ExactFiveHourRegex.IsMatch(line))) hasWindowLabel = true;
+            if (!hasGeminiPool && ExactGeminiPoolRegex.IsMatch(line)) hasGeminiPool = true;
+            if (!hasClaudePool && ExactClaudePoolRegex.IsMatch(line)) hasClaudePool = true;
         }
-        // Strict gate 1: require BOTH an exact standalone quota heading AND an exact standalone 5h/weekly label.
-        if (!hasQuotaHeader || !hasWindowLabel) return false;
+        // Strict gate 1: require standalone 5h/weekly label AND either standalone heading OR both standalone pool titles.
+        if (!hasWindowLabel || (!hasQuotaHeader && !(hasGeminiPool && hasClaudePool))) return false;
 
         PoolQuotaState g5 = null, g7 = null, c5 = null, c7 = null;
         string currentPool = "";
@@ -518,11 +522,27 @@ internal static class DualSlotStore
             };
             string target = Path.Combine(stateDir, "quota.uia.slot" + (seq % 2) + ".json");
             string tmp = Path.Combine(stateDir, ".quota.uia." + Guid.NewGuid().ToString("N") + ".tmp");
-            File.WriteAllText(tmp, Json.Serialize(doc), Encoding.UTF8);
-            if (File.Exists(target)) File.Replace(tmp, target, null, true);
-            else File.Move(tmp, target);
+            string serialized = Json.Serialize(doc);
+            File.WriteAllText(tmp, serialized, new UTF8Encoding(false));
+            for (int attempt = 0; attempt < 3; attempt++)
+            {
+                try
+                {
+                    if (File.Exists(target)) File.Replace(tmp, target, null, true);
+                    else File.Move(tmp, target);
+                    break;
+                }
+                catch (IOException)
+                {
+                    if (attempt == 2) throw;
+                    System.Threading.Thread.Sleep(35);
+                }
+            }
         }
-        catch { }
+        catch (Exception ex)
+        {
+            try { File.AppendAllText(Path.Combine(stateDir, "overlay.log"), DateTime.Now.ToString("s") + " quota-write-err: " + ex.GetType().Name + ": " + ex.Message + Environment.NewLine); } catch { }
+        }
     }
 
     internal static MonitorSnapshot LoadSnapshot(string stateDir, DateTime nowUtc)
