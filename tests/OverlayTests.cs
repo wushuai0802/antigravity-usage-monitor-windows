@@ -160,6 +160,32 @@ internal static class OverlayTests
         Assert(oc.Weekly != null && Math.Abs(oc.Weekly.RemainingPct - 48.0) < 0.01, "Claude weekly should be 48%");
         Assert(oc.FiveHour != null && Math.Abs(oc.FiveHour.RemainingPct - 0.0) < 0.01, "Claude 5h should be 0%");
 
+        // Verify React split-span nodes (["85", "%", "剩余"], ["6 天 16 小时", "后重置"], ["Claude", "和 GPT 模型"])
+        var splitSpanLines = new[]
+        {
+            "使用量",
+            "Gemini", "模型",
+            "周限额",
+            "85", "%", "剩余",
+            "6 天 16 小时", "后重置",
+            "5 小时限额",
+            "42%", "剩余",
+            "2 小时 2 分钟", "后重置",
+            "Claude", "和 GPT 模型",
+            "周限额",
+            "48%", "剩余",
+            "6 天 23 小时", "后重置",
+            "5 小时限额",
+            "0%", "剩余",
+            "4 小时 32 分钟", "后重置"
+        };
+        PoolQuotaState sg, sc;
+        bool splitOk = UiaQuotaParser.TryParseFromLines(splitSpanLines, now, out sg, out sc);
+        Assert(splitOk && sg != null && sc != null, "Split-span Usage popover lines must merge and parse both pools");
+        Assert(sg.FiveHour != null && Math.Abs(sg.FiveHour.RemainingPct - 42.0) < 0.01 && sg.FiveHour.ResetAtUtc.HasValue, "Split Gemini 5h should be 42% with reset");
+        Assert(sc.Weekly != null && Math.Abs(sc.Weekly.RemainingPct - 48.0) < 0.01 && sc.Weekly.ResetAtUtc.HasValue, "Split Claude 7d should be 48% with reset");
+        Assert(sc.FiveHour != null && Math.Abs(sc.FiveHour.RemainingPct - 0.0) < 0.01 && sc.FiveHour.ResetAtUtc.HasValue, "Split Claude 5h should be 0% with reset");
+
         // Guard: ordinary chat lines mentioning quota keywords and percentages must NOT be misread
         var chatLines = new[]
         {

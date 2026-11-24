@@ -197,6 +197,7 @@ internal sealed class AnchorFinder
     private static readonly Regex CurrentModelExtract = new Regex(@"(?:current|当前)\s*[:：]\s*(.+)$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
     private AutomationElement _root;
+    private AutomationElement _webDoc;
     private AutomationElement _modelButton;
     private AutomationElement _composerInput;
     private readonly List<AutomationElement> _rowControls = new List<AutomationElement>();
@@ -218,7 +219,7 @@ internal sealed class AnchorFinder
                 _window = window;
                 Search(window, stateDir);
             }
-            if (_root != null) TryOpportunisticQuotaScan(_root, stateDir, true);
+            if (_webDoc != null) TryOpportunisticQuotaScan(_webDoc, window, stateDir, true);
             if (_modelButton == null) { Stage = "model-not-found"; return null; }
             if (_modelButton.Current.IsOffscreen) { Invalidate(); Stage = "offscreen"; return null; }
 
@@ -291,20 +292,25 @@ internal sealed class AnchorFinder
         _rowControls.Clear();
 
         _root = AutomationElement.FromHandle(window);
+        _webDoc = null;
         if (_root == null) return;
+
+        // Always scope UIA searches to Electron's main RootWebArea Document, isolating our own owned WPF overlay window.
+        var docs = FindWebDocuments(_root);
+        _webDoc = docs.Count > 0 ? docs[docs.Count - 1] : _root;
 
         Native.RECT frame;
         Native.GetWindowRect(window, out frame);
         double scale = Native.Scale(window);
 
         // Detect theme from Antigravity root group ClassName (e.g., "theme-standalone dark dark-theme theme-dark")
-        _cachedLightTheme = DetectTheme(_root);
+        _cachedLightTheme = DetectTheme(_webDoc);
 
         // Locate composer input ("Message input" ComboBox or Edit near lower half)
         var inputCond = new OrCondition(
             new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.ComboBox),
             new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Edit));
-        var inputs = _root.FindAll(TreeScope.Descendants, inputCond);
+        var inputs = _webDoc.FindAll(TreeScope.Descendants, inputCond);
         var inputBoxes = new List<KeyValuePair<AutomationElement, Rect>>();
         foreach (AutomationElement el in inputs)
         {
@@ -319,7 +325,7 @@ internal sealed class AnchorFinder
         }
 
         // Locate model picker button directly below the composer input
-        var buttons = _root.FindAll(TreeScope.Descendants, new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Button));
+        var buttons = _webDoc.FindAll(TreeScope.Descendants, new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Button));
         double bestBottom = double.MinValue;
         AutomationElement bestModel = null;
         Rect bestInputRect = Rect.Empty;
@@ -357,7 +363,7 @@ internal sealed class AnchorFinder
         if (bestModel == null)
         {
             _nextSearch = DateTime.UtcNow.AddSeconds(1);
-            TryOpportunisticQuotaScan(_root, stateDir);
+            TryOpportunisticQuotaScan(_webDoc, window, stateDir, true);
             return;
         }
 
@@ -379,49 +385,106 @@ internal sealed class AnchorFinder
             catch { }
         }
 
-        TryOpportunisticQuotaScan(_root, stateDir);
+        TryOpportunisticQuotaScan(_webDoc, window, stateDir, false);
     }
 
+    private static readonly System.Windows.Automation.Condition QuotaAnchorCondition = new OrCondition(
+        new PropertyCondition(AutomationElement.NameProperty, "5 小时限额"),
+        new PropertyCondition(AutomationElement.NameProperty, "剩余五小时限制"),
+        new PropertyCondition(AutomationElement.NameProperty, "周限额"),
+        new PropertyCondition(AutomationElement.NameProperty, "剩余每周限制"),
+        new PropertyCondition(AutomationElement.NameProperty, "5-hour limit"),
+        new PropertyCondition(AutomationElement.NameProperty, "Weekly limit"));
     private string _lastSavedQuotaSummary = "";
 
-    private void TryOpportunisticQuotaScan(AutomationElement root, string stateDir, bool fastMode = false)
+    private void TryOpportunisticQuotaScan(AutomationElement webDoc, IntPtr window, string stateDir, bool fastMode)
     {
-        if (string.IsNullOrEmpty(stateDir) || DateTime.UtcNow < _nextQuotaScan) return;
-        _nextQuotaScan = DateTime.UtcNow.AddMilliseconds(fastMode ? 350 : 700);
+        if (webDoc == null || string.IsNullOrEmpty(stateDir) || DateTime.UtcNow < _nextQuotaScan) return;
+        _nextQuotaScan = DateTime.UtcNow.AddMilliseconds(fastMode ? 450 : 900);
         try
         {
-            if (root == null) return;
-            // Locate Electron's RootWebArea Document by skipping owned WPF Window children so overlay redraws never throw ElementNotAvailableException.
-            var docs = FindWebDocuments(root);
-            var walker = TreeWalker.ControlViewWalker;
-            for (int d = docs.Count - 1; d >= 0; d--)
-            {
-                AutomationElement themeRoot = null;
-                try { themeRoot = walker.GetFirstChild(docs[d]); } catch { }
-                if (themeRoot == null) continue;
+            Native.RECT frame;
+            if (!Native.GetWindowRect(window, out frame)) return;
+            double scale = Native.Scale(window);
 
-                // Under themeRoot: GRAND[0] has AutomationId == "root" (main chat app).
-                // All sibling nodes (AID != "root") are React/Base-UI portals (model menu, Usage popover, "模型额度" settings modal).
-                var portalLines = new List<string>();
-                AutomationElement sibling = null;
-                try { sibling = walker.GetFirstChild(themeRoot); } catch { }
-                int sibGuard = 0;
-                while (sibling != null && sibGuard++ < 32)
+            // Single fast native UIA query inside Electron Document only (never touches our owned WPF overlay window).
+            var anchors = webDoc.FindAll(TreeScope.Descendants, QuotaAnchorCondition);
+            if (anchors == null || anchors.Count == 0) return;
+
+            var visibleAnchors = new List<AutomationElement>();
+            for (int i = anchors.Count - 1; i >= 0; i--)
+            {
+                try
                 {
+                    var el = anchors[i];
+                    if (!el.Current.IsOffscreen) visibleAnchors.Add(el);
+                }
+                catch { }
+                if (visibleAnchors.Count >= 4) break;
+            }
+            if (visibleAnchors.Count == 0) return;
+
+            // Climb via geometry ONLY (zero nested FindAll calls!) to locate the enclosing popover/modal card,
+            // then run CollectLinesFaultTolerant at most once per candidate container.
+            var walker = TreeWalker.ControlViewWalker;
+            var candidates = new List<AutomationElement>();
+            foreach (var anchor in visibleAnchors)
+            {
+                AutomationElement cur = anchor;
+                AutomationElement bestCard = null;
+                for (int d = 0; d < 12 && cur != null; d++)
+                {
+                    if (cur == webDoc) break;
                     try
                     {
-                        string aid = sibling.Current.AutomationId ?? "";
-                        if (!string.Equals(aid, "root", StringComparison.OrdinalIgnoreCase)
-                            && !aid.StartsWith("a11y-live-announcer", StringComparison.OrdinalIgnoreCase))
+                        string aid = cur.Current.AutomationId ?? "";
+                        if (string.Equals(aid, "root", StringComparison.OrdinalIgnoreCase)) break;
+                        Rect r = cur.Current.BoundingRectangle;
+                        if (!r.IsEmpty && r.Width >= 220 * scale && r.Height >= 160 * scale
+                            && r.Width <= frame.Width * 0.94 && r.Height <= frame.Height * 0.94)
                         {
-                            CollectLinesFaultTolerant(sibling, portalLines, 600);
+                            bestCard = cur;
                         }
                     }
-                    catch { }
-                    try { sibling = walker.GetNextSibling(sibling); } catch { break; }
+                    catch { break; }
+                    try { cur = walker.GetParent(cur); } catch { break; }
                 }
+                if (bestCard != null && !candidates.Contains(bestCard)) candidates.Add(bestCard);
+            }
 
-                if (portalLines.Count > 0 && TryCommitQuotaLines(portalLines, stateDir)) return;
+            PoolQuotaState bestG = null, bestC = null;
+            int bestScore = 0;
+            foreach (var card in candidates)
+            {
+                var lines = new List<string>();
+                CollectLinesFaultTolerant(card, lines, 450);
+                if (lines.Count == 0) continue;
+                PoolQuotaState g, c;
+                if (UiaQuotaParser.TryParseFromLines(lines, DateTime.UtcNow, out g, out c))
+                {
+                    int score = (g != null ? (g.FiveHour != null && g.Weekly != null ? 2 : 1) : 0)
+                              + (c != null ? (c.FiveHour != null && c.Weekly != null ? 2 : 1) : 0);
+                    if (score > bestScore)
+                    {
+                        bestScore = score;
+                        bestG = g;
+                        bestC = c;
+                    }
+                    if (bestScore >= 4) break;
+                }
+            }
+
+            if (bestG != null || bestC != null)
+            {
+                DualSlotStore.WriteQuotaFromUia(stateDir, bestG, bestC, DateTime.UtcNow);
+                string summary = string.Format("G={0} C={1}",
+                    bestG == null ? "null" : (bestG.RemainingPct + "%(5h=" + (bestG.FiveHour != null ? bestG.FiveHour.RemainingPct.ToString() : "-") + ",7d=" + (bestG.Weekly != null ? bestG.Weekly.RemainingPct.ToString() : "-") + ")"),
+                    bestC == null ? "null" : (bestC.RemainingPct + "%(5h=" + (bestC.FiveHour != null ? bestC.FiveHour.RemainingPct.ToString() : "-") + ",7d=" + (bestC.Weekly != null ? bestC.Weekly.RemainingPct.ToString() : "-") + ")"));
+                if (summary != _lastSavedQuotaSummary)
+                {
+                    _lastSavedQuotaSummary = summary;
+                    Program.Note("quota-uia-saved: " + summary);
+                }
             }
         }
         catch { }

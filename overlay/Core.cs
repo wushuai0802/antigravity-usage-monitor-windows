@@ -293,17 +293,24 @@ internal static class UiaQuotaParser
         claude = null;
         if (lines == null) return false;
 
-        var list = new List<string>();
-        bool hasQuotaHeader = false;
-        bool hasWindowLabel = false;
-        bool hasGeminiPool = false;
-        bool hasClaudePool = false;
+        var rawList = new List<string>();
         foreach (string raw in lines)
         {
             if (string.IsNullOrWhiteSpace(raw)) continue;
             string line = raw.Trim();
             if (line.Length > 48) continue; // Quota modal/popover labels are always short standalone nodes; ignore chat paragraphs.
-            list.Add(line);
+            rawList.Add(line);
+        }
+
+        // Rejoin adjacent short inline spans that Chromium UIA splits (e.g. ["6 天 16 小时", "后重置"], ["85", "%", "剩余"]).
+        var list = MergeSplitLines(rawList);
+
+        bool hasQuotaHeader = false;
+        bool hasWindowLabel = false;
+        bool hasGeminiPool = false;
+        bool hasClaudePool = false;
+        foreach (string line in list)
+        {
             if (!hasQuotaHeader && ExactHeaderRegex.IsMatch(line)) hasQuotaHeader = true;
             if (!hasWindowLabel && (ExactWeeklyRegex.IsMatch(line) || ExactFiveHourRegex.IsMatch(line))) hasWindowLabel = true;
             if (!hasGeminiPool && ExactGeminiPoolRegex.IsMatch(line)) hasGeminiPool = true;
@@ -409,6 +416,43 @@ internal static class UiaQuotaParser
         gemini = CombinePool("gemini", g5, g7);
         claude = CombinePool("claude", c5, c7);
         return gemini != null || claude != null;
+    }
+
+    internal static List<string> MergeSplitLines(List<string> input)
+    {
+        var merged = new List<string>();
+        for (int i = 0; i < input.Count; i++)
+        {
+            string cur = input[i];
+            if (merged.Count > 0)
+            {
+                string prev = merged[merged.Count - 1];
+                string lowCur = cur.ToLowerInvariant();
+                // Merge ["85", "%"] or ["85%", "剩余"] or ["85", "% 剩余"]
+                if ((cur == "%" || lowCur == "剩余" || lowCur == "remaining" || lowCur == "% 剩余" || lowCur == "% remaining")
+                    && Regex.IsMatch(prev, @"^\d{1,3}(?:\.\d+)?%?$"))
+                {
+                    merged[merged.Count - 1] = cur.StartsWith("%") ? (prev + cur) : (prev + " " + cur);
+                    continue;
+                }
+                // Merge ["6 天 16 小时", "后重置"] / ["2 小时 2 分钟", "后刷新"]
+                if ((lowCur == "后重置" || lowCur == "后刷新" || lowCur == "重置" || lowCur == "刷新")
+                    && Regex.IsMatch(prev, @"\d+\s*(?:天|小时|分钟|分|d|h|m)", RegexOptions.IgnoreCase))
+                {
+                    merged[merged.Count - 1] = prev + " " + cur;
+                    continue;
+                }
+                // Merge ["Claude", "和 GPT 模型"] or ["Gemini", "模型"]
+                if ((prev.Equals("Claude", StringComparison.OrdinalIgnoreCase) && (cur.StartsWith("和") || lowCur.StartsWith("and")))
+                    || (prev.Equals("Gemini", StringComparison.OrdinalIgnoreCase) && (cur == "模型" || lowCur == "models" || lowCur == "model")))
+                {
+                    merged[merged.Count - 1] = prev + " " + cur;
+                    continue;
+                }
+            }
+            merged.Add(cur);
+        }
+        return merged;
     }
 
     internal static PoolQuotaState CombinePool(string pool, PoolQuotaState fiveHour, PoolQuotaState weekly)
