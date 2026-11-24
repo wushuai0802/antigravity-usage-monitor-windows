@@ -218,6 +218,7 @@ internal sealed class AnchorFinder
                 _window = window;
                 Search(window, stateDir);
             }
+            if (_root != null) TryOpportunisticQuotaScan(_root, stateDir, true);
             if (_modelButton == null) { Stage = "model-not-found"; return null; }
             if (_modelButton.Current.IsOffscreen) { Invalidate(); Stage = "offscreen"; return null; }
 
@@ -236,7 +237,6 @@ internal sealed class AnchorFinder
                 var menu = _root.FindFirst(TreeScope.Descendants, new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Menu));
                 if (menu != null && !menu.Current.IsOffscreen && !menu.Current.BoundingRectangle.IsEmpty) menuOpen = true;
             }
-            if (_root != null) TryOpportunisticQuotaScan(_root, stateDir, menuOpen);
 
             double scale = Native.Scale(window);
             Rect inputRect = _composerInput != null && !_composerInput.Current.IsOffscreen ? _composerInput.Current.BoundingRectangle : Rect.Empty;
@@ -385,7 +385,7 @@ internal sealed class AnchorFinder
     private void TryOpportunisticQuotaScan(AutomationElement root, string stateDir, bool fastMode = false)
     {
         if (string.IsNullOrEmpty(stateDir) || DateTime.UtcNow < _nextQuotaScan) return;
-        _nextQuotaScan = DateTime.UtcNow.AddMilliseconds(fastMode ? 450 : 1200);
+        _nextQuotaScan = DateTime.UtcNow.AddMilliseconds(fastMode ? 500 : 1200);
         try
         {
             AutomationElement dialogScope = FindQuotaDialogScope(root);
