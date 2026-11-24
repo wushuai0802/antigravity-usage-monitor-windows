@@ -30,8 +30,8 @@ internal sealed class PassiveWindow : Window
         Background = Brushes.Transparent;
         Focusable = false;
         SizeToContent = SizeToContent.Manual;
-        TextOptions.SetTextFormattingMode(this, TextFormattingMode.Ideal);
-        TextOptions.SetTextRenderingMode(this, TextRenderingMode.Grayscale);
+        TextOptions.SetTextFormattingMode(this, TextFormattingMode.Display);
+        TextOptions.SetTextRenderingMode(this, TextRenderingMode.ClearType);
         UseLayoutRounding = true;
         SourceInitialized += (s, e) =>
         {

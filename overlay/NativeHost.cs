@@ -219,6 +219,7 @@ internal sealed class AnchorFinder
                 Search(window, stateDir);
             }
             if (_modelButton == null) { Stage = "model-not-found"; return null; }
+            if (_root != null) TryOpportunisticQuotaScan(_root, stateDir);
             if (_modelButton.Current.IsOffscreen) { Invalidate(); Stage = "offscreen"; return null; }
 
             Rect modelRect = _modelButton.Current.BoundingRectangle;
@@ -387,18 +388,22 @@ internal sealed class AnchorFinder
         _nextQuotaScan = DateTime.UtcNow.AddSeconds(2);
         try
         {
-            var texts = root.FindAll(TreeScope.Descendants, new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Text));
+            // Prefer scanning inside an open modal/dialog container so chat transcript text is never read.
+            AutomationElement scopeRoot = FindQuotaDialogScope(root) ?? root;
+            var cond = new OrCondition(
+                new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Text),
+                new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Header));
+            var nodes = scopeRoot.FindAll(TreeScope.Descendants, cond);
             var lines = new List<string>();
-            // Scan full visible text tree (settings/quota modal typically mounts near the tail of the DOM).
-            int limit = Math.Min(texts.Count, 1800);
+            int limit = Math.Min(nodes.Count, 2400);
             for (int i = 0; i < limit; i++)
             {
                 try
                 {
-                    var el = texts[i];
+                    var el = nodes[i];
                     if (el.Current.IsOffscreen) continue;
                     string n = el.Current.Name;
-                    if (!string.IsNullOrWhiteSpace(n) && n.Length <= 120) lines.Add(n);
+                    if (!string.IsNullOrWhiteSpace(n) && n.Length <= 48) lines.Add(n.Trim());
                 }
                 catch { }
             }
@@ -409,6 +414,35 @@ internal sealed class AnchorFinder
             }
         }
         catch { }
+    }
+
+    private static AutomationElement FindQuotaDialogScope(AutomationElement root)
+    {
+        try
+        {
+            var cond = new OrCondition(
+                new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Window),
+                new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Pane),
+                new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Group));
+            var all = root.FindAll(TreeScope.Descendants, cond);
+            for (int i = all.Count - 1; i >= 0; i--)
+            {
+                try
+                {
+                    var el = all[i];
+                    if (el.Current.IsOffscreen) continue;
+                    string localized = (el.Current.LocalizedControlType ?? "").ToLowerInvariant();
+                    string cls = (el.Current.ClassName ?? "").ToLowerInvariant();
+                    if (localized.Contains("dialog") || localized.Contains("对话框") || cls.Contains("dialog") || cls.Contains("modal"))
+                    {
+                        return el;
+                    }
+                }
+                catch { }
+            }
+        }
+        catch { }
+        return null;
     }
 
     private static bool? DetectTheme(AutomationElement root)

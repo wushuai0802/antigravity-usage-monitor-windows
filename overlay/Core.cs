@@ -254,12 +254,24 @@ internal static class QuotaEvaluator
 
 internal static class UiaQuotaParser
 {
-    private static readonly Regex PctRegex = new Regex(@"(?<!\d)(\d{1,3}(?:\.\d+)?)\s*%", RegexOptions.Compiled);
+    private static readonly Regex ExactPctRegex = new Regex(@"^\s*(\d{1,3}(?:\.\d+)?)\s*%\s*$", RegexOptions.Compiled);
     private static readonly Regex RelativeResetRegex = new Regex(
         @"(?:(\d+)\s*(?:d|day|days|天))?\s*(?:(\d+)\s*(?:h|hr|hrs|hour|hours|小时))?\s*(?:(\d+)\s*(?:m|min|mins|minute|minutes|分钟|分))?",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
-    private static readonly Regex QuotaHeaderRegex = new Regex(
-        @"(模型额度|剩余每周限制|剩余五小时限制|models?\s*&\s*(?:quota|usage)|model\s+quotas?|usage\s+limits?|weekly\s+limit|5-?hour\s+limit|模型与配额)",
+    private static readonly Regex ExactHeaderRegex = new Regex(
+        @"^(模型额度|model\s+quotas?|models?\s*&\s*(?:quota|usage))$",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex ExactGeminiPoolRegex = new Regex(
+        @"^gemini\s*(模型|models?)$",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex ExactClaudePoolRegex = new Regex(
+        @"^claude\s*(?:和|and|/|&)\s*(?:gpt|第三方)\s*(模型|models?)?$",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex ExactWeeklyRegex = new Regex(
+        @"^(剩余每周限制|每周限制|weekly\s+limit(?:\s+remaining)?|remaining\s+weekly\s+limit)$",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex ExactFiveHourRegex = new Regex(
+        @"^(剩余五小时限制|剩余\s*5\s*小时限制|五小时限制|5-?hour\s+limit(?:\s+remaining)?|five-?hour\s+limit(?:\s+remaining)?|remaining\s+5-?hour\s+limit)$",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
     internal static bool TryParseFromLines(IEnumerable<string> lines, DateTime nowUtc, out PoolQuotaState gemini, out PoolQuotaState claude)
@@ -270,36 +282,37 @@ internal static class UiaQuotaParser
 
         var list = new List<string>();
         bool hasQuotaHeader = false;
+        bool hasWindowLabel = false;
         foreach (string raw in lines)
         {
             if (string.IsNullOrWhiteSpace(raw)) continue;
             string line = raw.Trim();
+            if (line.Length > 48) continue; // Quota modal labels/values are always short standalone nodes; ignore chat paragraphs.
             list.Add(line);
-            if (!hasQuotaHeader && QuotaHeaderRegex.IsMatch(line)) hasQuotaHeader = true;
+            if (!hasQuotaHeader && ExactHeaderRegex.IsMatch(line)) hasQuotaHeader = true;
+            if (!hasWindowLabel && (ExactWeeklyRegex.IsMatch(line) || ExactFiveHourRegex.IsMatch(line))) hasWindowLabel = true;
         }
-        // Strict gate 1: require an explicit quota panel heading so chat messages are never misread.
-        if (!hasQuotaHeader) return false;
+        // Strict gate 1: require BOTH an exact standalone quota heading AND an exact standalone 5h/weekly label.
+        if (!hasQuotaHeader || !hasWindowLabel) return false;
 
         PoolQuotaState g5 = null, g7 = null, c5 = null, c7 = null;
         string currentPool = "";
-        string currentWindow = ""; // "5h" or "7d" or ""
+        string currentWindow = "";
         DateTime? pendingReset = null;
         double? pendingPct = null;
 
         Action commitPending = () =>
         {
-            if (string.IsNullOrEmpty(currentPool) || !pendingPct.HasValue || !pendingReset.HasValue) return;
+            if (string.IsNullOrEmpty(currentPool) || string.IsNullOrEmpty(currentWindow) || !pendingPct.HasValue || !pendingReset.HasValue) return;
             PoolQuotaState st = QuotaEvaluator.Evaluate(currentPool, pendingPct.Value, pendingReset, nowUtc);
-            string kind = !string.IsNullOrEmpty(currentWindow) ? currentWindow : st.WindowKind;
-            if (kind == "7d")
+            st.WindowKind = currentWindow;
+            if (currentWindow == "7d")
             {
-                st.WindowKind = "7d";
                 if (currentPool == "gemini") g7 = st;
                 else if (currentPool == "claude") c7 = st;
             }
             else
             {
-                st.WindowKind = "5h";
                 if (currentPool == "gemini") g5 = st;
                 else if (currentPool == "claude") c5 = st;
             }
@@ -309,9 +322,7 @@ internal static class UiaQuotaParser
 
         foreach (string line in list)
         {
-            string low = line.ToLowerInvariant();
-
-            if (low == "gemini 模型" || low == "gemini models" || (low.Contains("gemini") && (low.Contains("模型") || low.Contains("model")) && !low.Contains("orchestrator") && !low.Contains("extra") && !low.Contains("high")))
+            if (ExactGeminiPoolRegex.IsMatch(line))
             {
                 commitPending();
                 currentPool = "gemini";
@@ -320,7 +331,7 @@ internal static class UiaQuotaParser
                 pendingPct = null;
                 continue;
             }
-            if (low.Contains("claude") && (low.Contains("模型") || low.Contains("model") || low.Contains("gpt")))
+            if (ExactClaudePoolRegex.IsMatch(line))
             {
                 commitPending();
                 currentPool = "claude";
@@ -332,33 +343,38 @@ internal static class UiaQuotaParser
 
             if (string.IsNullOrEmpty(currentPool)) continue;
 
-            if (low.Contains("每周限制") || low.Contains("weekly"))
+            if (ExactWeeklyRegex.IsMatch(line))
             {
                 commitPending();
                 currentWindow = "7d";
                 pendingReset = null;
                 pendingPct = null;
+                continue;
             }
-            else if (low.Contains("五小时限制") || low.Contains("5小时") || low.Contains("5-hour") || low.Contains("five-hour") || low.Contains("5 hour"))
+            if (ExactFiveHourRegex.IsMatch(line))
             {
                 commitPending();
                 currentWindow = "5h";
                 pendingReset = null;
                 pendingPct = null;
+                continue;
             }
 
-            DateTime? resetUtc = TryParseResetTime(line, nowUtc);
-            if (resetUtc.HasValue) pendingReset = resetUtc;
+            if (string.IsNullOrEmpty(currentWindow)) continue;
 
-            Match pm = PctRegex.Match(line);
-            if (pm.Success)
+            DateTime? resetUtc = TryParseResetTime(line, nowUtc);
+            if (resetUtc.HasValue)
             {
-                double pct;
-                if (double.TryParse(pm.Groups[1].Value, NumberStyles.Float, CultureInfo.InvariantCulture, out pct) && pct >= 0 && pct <= 100)
+                pendingReset = resetUtc;
+            }
+            else
+            {
+                Match pm = ExactPctRegex.Match(line);
+                if (pm.Success)
                 {
-                    if (!low.Contains("context") && !low.Contains("上下文") && !low.Contains("cache") && !low.Contains("缓存"))
+                    double pct;
+                    if (double.TryParse(pm.Groups[1].Value, NumberStyles.Float, CultureInfo.InvariantCulture, out pct) && pct >= 0 && pct <= 100)
                     {
-                        if (low.Contains("used") || low.Contains("已用")) pct = Math.Max(0, 100.0 - pct);
                         pendingPct = pct;
                     }
                 }

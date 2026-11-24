@@ -113,15 +113,15 @@ internal static class OverlayTests
         Assert(c.FiveHour != null && Math.Abs(c.FiveHour.RemainingPct - 12.0) < 0.01 && c.FiveHour.WindowKind == "5h", "Claude 5h should be 12%");
         Assert(c.Weekly != null && Math.Abs(c.Weekly.RemainingPct - 56.0) < 0.01 && c.Weekly.WindowKind == "7d", "Claude 7d should be 56%");
 
-        // Guard: ordinary chat lines mentioning percentages must NOT be misread as quota
+        // Guard: ordinary chat lines mentioning quota keywords and percentages must NOT be misread
         var chatLines = new[]
         {
-            "Gemini 25% remaining",
-            "Claude 12% remaining"
+            "识别 模型额度、Gemini 模型、Claude 和 GPT 模型、剩余每周限制、剩余五小时限制",
+            "从你截图看当前 Gemini 5h 窗口已剩 5%，约 2h 43m 后刷新"
         };
         PoolQuotaState g2, c2;
         bool chatOk = UiaQuotaParser.TryParseFromLines(chatLines, now, out g2, out c2);
-        Assert(!chatOk && g2 == null && c2 == null, "Chat prose without quota panel heading & reset time must be rejected");
+        Assert(!chatOk && g2 == null && c2 == null, "Chat prose discussing quota labels must be rejected");
     }
 
     private static void TestNarrowPriorityTrim()
