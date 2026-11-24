@@ -640,9 +640,10 @@ internal sealed class OverlayController
         if (p.Alert == QuotaAlertLevel.Critical7d) barBrush = pal.CritBrush;
         else if (p.Alert == QuotaAlertLevel.Warn5h) barBrush = pal.WarnBrush;
 
-        string rightVal = p.Alert == QuotaAlertLevel.ResetPassed
-            ? "已重置"
-            : string.Format(CultureInfo.InvariantCulture, "{0:0}% · {1}", p.RemainingPct, p.CountdownText);
+        string rightVal;
+        if (p.Alert == QuotaAlertLevel.ResetPassed) rightVal = "已重置";
+        else if (string.IsNullOrEmpty(p.CountdownText)) rightVal = string.Format(CultureInfo.InvariantCulture, "{0:0}%", p.RemainingPct);
+        else rightVal = string.Format(CultureInfo.InvariantCulture, "{0:0}% · {1}", p.RemainingPct, p.CountdownText);
         sp.Children.Add(MakeKv(label, rightVal, pal, barBrush));
         sp.Children.Add(MakeProgressBar(p.RemainingPct, barBrush, pal));
         if (!string.IsNullOrEmpty(p.AlertHint))

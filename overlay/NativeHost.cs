@@ -385,14 +385,13 @@ internal sealed class AnchorFinder
     private void TryOpportunisticQuotaScan(AutomationElement root, string stateDir, bool fastMode = false)
     {
         if (string.IsNullOrEmpty(stateDir) || DateTime.UtcNow < _nextQuotaScan) return;
-        _nextQuotaScan = DateTime.UtcNow.AddMilliseconds(fastMode ? 450 : 2000);
+        _nextQuotaScan = DateTime.UtcNow.AddMilliseconds(fastMode ? 450 : 1200);
         try
         {
             AutomationElement dialogScope = FindQuotaDialogScope(root);
-            if (dialogScope != null && ScanElementForQuota(dialogScope, stateDir, true, false)) return;
-            if (ScanElementForQuota(root, stateDir, false, fastMode)) return;
+            if (dialogScope != null && ScanElementForQuota(dialogScope, stateDir, true)) return;
+            if (ScanElementForQuota(root, stateDir, false)) return;
 
-            // If a menu/popover is open, also check sibling popup HWNDs belonging to the same Antigravity process.
             if (fastMode && _window != IntPtr.Zero)
             {
                 uint hostPid;
@@ -409,25 +408,19 @@ internal sealed class AnchorFinder
                 foreach (IntPtr pop in siblingPopups)
                 {
                     var popEl = AutomationElement.FromHandle(pop);
-                    if (popEl != null && ScanElementForQuota(popEl, stateDir, true, true)) return;
+                    if (popEl != null && ScanElementForQuota(popEl, stateDir, true)) return;
                 }
             }
         }
         catch { }
     }
 
-    private static bool ScanElementForQuota(AutomationElement scopeRoot, string stateDir, bool includeOffscreen, bool logMiss)
+    private bool ScanElementForQuota(AutomationElement scopeRoot, string stateDir, bool includeOffscreen)
     {
-        var cond = new OrCondition(
-            new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Text),
-            new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Header),
-            new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.MenuItem),
-            new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.ListItem));
-        var nodes = scopeRoot.FindAll(TreeScope.Descendants, cond);
+        var nodes = scopeRoot.FindAll(TreeScope.Descendants, System.Windows.Automation.Condition.TrueCondition);
         var lines = new List<string>();
-        // React/Base-UI portals (settings modals and Usage popovers) always mount at the tail of the DOM tree.
-        // Scanning the last 600 nodes skips thousands of earlier chat-transcript text nodes and never truncates the modal tail.
-        int start = includeOffscreen ? 0 : Math.Max(0, nodes.Count - 600);
+        // React/Base-UI portals always mount at the tail of the DOM tree.
+        int start = includeOffscreen ? 0 : Math.Max(0, nodes.Count - 400);
         for (int i = start; i < nodes.Count; i++)
         {
             try
@@ -435,7 +428,7 @@ internal sealed class AnchorFinder
                 var el = nodes[i];
                 if (!includeOffscreen && el.Current.IsOffscreen) continue;
                 string n = el.Current.Name;
-                if (string.IsNullOrWhiteSpace(n) || n.Length > 64) continue;
+                if (string.IsNullOrWhiteSpace(n) || n.Length > 80) continue;
                 foreach (string part in n.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
                 {
                     string t = part.Trim();
@@ -448,11 +441,6 @@ internal sealed class AnchorFinder
         if (UiaQuotaParser.TryParseFromLines(lines, DateTime.UtcNow, out g, out c))
         {
             DualSlotStore.WriteQuotaFromUia(stateDir, g, c, DateTime.UtcNow);
-            if (g != null && c == null)
-            {
-                int idx = lines.FindLastIndex(l => l.IndexOf("Gemini", StringComparison.OrdinalIgnoreCase) >= 0);
-                if (idx >= 0) Program.Note("quota-partial-tail: " + string.Join(" | ", lines.Skip(idx).Take(25).ToArray()));
-            }
             return true;
         }
         return false;

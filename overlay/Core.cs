@@ -216,9 +216,22 @@ internal static class QuotaEvaluator
         state.WindowKind = "";
         state.Alert = QuotaAlertLevel.None;
         state.AlertHint = "";
-        state.CountdownText = (state.RemainingPct >= 99.9) ? "满额" : "--";
+        state.CountdownText = (state.RemainingPct >= 99.9) ? "满额" : "";
 
-        if (!resetAtUtc.HasValue) return state;
+        if (!resetAtUtc.HasValue)
+        {
+            if (state.RemainingPct <= 5.0)
+            {
+                state.Alert = QuotaAlertLevel.Critical7d;
+                state.AlertHint = "额度紧张";
+            }
+            else if (state.RemainingPct <= 10.0)
+            {
+                state.Alert = QuotaAlertLevel.Warn5h;
+                state.AlertHint = "额度紧张";
+            }
+            return state;
+        }
 
         TimeSpan delta = resetAtUtc.Value - nowUtc;
         if (delta.TotalSeconds <= 0)
@@ -304,8 +317,8 @@ internal static class UiaQuotaParser
         Action commitPending = () =>
         {
             if (string.IsNullOrEmpty(currentPool) || string.IsNullOrEmpty(currentWindow) || !pendingPct.HasValue) return;
-            // Allow omitted reset time when pool is at 100% (unused window has not started ticking yet).
-            if (!pendingReset.HasValue && pendingPct.Value < 99.9) return;
+            // Strict gate 1 already verified exact standalone heading + pool + window labels;
+            // commit percentage even when the UI omits a reset-time line (e.g. 100% full, 0% exhausted, or clipped).
             PoolQuotaState st = QuotaEvaluator.Evaluate(currentPool, pendingPct.Value, pendingReset, nowUtc);
             st.WindowKind = currentWindow;
             if (currentWindow == "7d")

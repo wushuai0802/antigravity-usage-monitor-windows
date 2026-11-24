@@ -137,6 +137,29 @@ internal static class OverlayTests
         Assert(pc.FiveHour != null && Math.Abs(pc.FiveHour.RemainingPct - 100.0) < 0.01 && pc.FiveHour.CountdownText == "满额", "Popover Claude 5h 100% should show 满额");
         Assert(pc.Weekly != null && Math.Abs(pc.Weekly.RemainingPct - 100.0) < 0.01, "Popover Claude 7d should be 100%");
 
+        // Verify modal where Claude pool omits reset-time lines (e.g. 48% / 0%)
+        var omittedResetLines = new[]
+        {
+            "模型额度",
+            "Gemini 模型",
+            "剩余每周限制",
+            "6 天 16 小时后刷新",
+            "91%",
+            "剩余五小时限制",
+            "2 小时 18 分钟后刷新",
+            "71%",
+            "Claude 和 GPT 模型",
+            "剩余每周限制",
+            "48%",
+            "剩余五小时限制",
+            "0%"
+        };
+        PoolQuotaState og, oc;
+        bool omOk = UiaQuotaParser.TryParseFromLines(omittedResetLines, now, out og, out oc);
+        Assert(omOk && og != null && oc != null, "Modal with omitted reset lines on Claude pool must still parse both pools");
+        Assert(oc.Weekly != null && Math.Abs(oc.Weekly.RemainingPct - 48.0) < 0.01, "Claude weekly should be 48%");
+        Assert(oc.FiveHour != null && Math.Abs(oc.FiveHour.RemainingPct - 0.0) < 0.01, "Claude 5h should be 0%");
+
         // Guard: ordinary chat lines mentioning quota keywords and percentages must NOT be misread
         var chatLines = new[]
         {
