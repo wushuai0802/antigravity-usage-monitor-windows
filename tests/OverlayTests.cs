@@ -24,6 +24,7 @@ internal static class OverlayTests
         TestDualSlotQuotaRoundTrip();
         TestBurnRateAndAccountSwitchBoundary();
         TestMilestoneDeduplication();
+        TestAutoRefreshGuard();
         Console.WriteLine("C# OverlayTests passed: " + _passed + " assertions.");
         return 0;
     }
@@ -340,5 +341,26 @@ internal static class OverlayTests
         {
             if (Directory.Exists(tmp)) Directory.Delete(tmp, true);
         }
+    }
+
+    private static void TestAutoRefreshGuard()
+    {
+        // Background window must NEVER trigger even when idle >= 45s and interval elapsed
+        Assert(!AutoRefreshGuard.ShouldTrigger(true, false, 60.0, true, false, false, false, false, 120.0, 300.0, true, 30.0, 10, 5000000L),
+            "Background Antigravity window must never trigger auto quota refresh");
+        // Newly focused foreground window (< 15s) must wait
+        Assert(!AutoRefreshGuard.ShouldTrigger(true, true, 5.0, true, false, false, false, false, 60.0, 300.0, true, 30.0, 10, 0L),
+            "Freshly focused window (< 15s) must not trigger auto quota refresh");
+        // Active user (idle < 45s) or mouse button held must not trigger
+        Assert(!AutoRefreshGuard.ShouldTrigger(true, true, 60.0, true, false, false, false, false, 20.0, 300.0, true, 30.0, 10, 0L),
+            "User idle < 45s must not trigger auto quota refresh");
+        Assert(!AutoRefreshGuard.ShouldTrigger(true, true, 60.0, true, false, false, false, true, 60.0, 300.0, true, 30.0, 10, 0L),
+            "Held mouse button must not trigger auto quota refresh");
+        // Foreground >= 15s, idle >= 45s, interval elapsed -> allowed
+        Assert(AutoRefreshGuard.ShouldTrigger(true, true, 25.0, true, false, false, false, false, 50.0, 120.0, true, 12.0, 10, 0L),
+            "Foreground >= 15s + idle >= 45s + interval elapsed must allow auto quota refresh");
+        // Foreground >= 15s, idle >= 45s, burn >= 3M tokens and age >= 2m -> allowed
+        Assert(AutoRefreshGuard.ShouldTrigger(true, true, 25.0, true, false, false, false, false, 50.0, 120.0, true, 3.0, 10, 3500000L),
+            "Foreground >= 15s + idle >= 45s + >=3M token burn must allow auto quota refresh");
     }
 }

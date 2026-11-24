@@ -928,3 +928,39 @@ internal static class MetricFormatter
         return string.Format(CultureInfo.InvariantCulture, "{0} {1:0}%", prefix, p.RemainingPct);
     }
 }
+
+internal static class AutoRefreshGuard
+{
+    internal const double MinIdleSeconds = 45.0;
+    internal const double MinForegroundSeconds = 15.0;
+    internal const double MinAttemptCooldownSeconds = 90.0;
+    internal const long BurnThresholdTokens = 3000000L;
+
+    internal static bool ShouldTrigger(
+        bool enabled,
+        bool isForeground,
+        double foregroundSeconds,
+        bool hasAnchor,
+        bool menuOpen,
+        bool isMoving,
+        bool isPanelOpen,
+        bool anyMouseButtonDown,
+        double idleSeconds,
+        double sinceLastAttemptSeconds,
+        bool hasQuotaTimestamp,
+        double quotaAgeMinutes,
+        int intervalMinutes,
+        long tokenDeltaSinceLastQuota)
+    {
+        if (!enabled || !isForeground || !hasAnchor || menuOpen || isMoving || isPanelOpen || anyMouseButtonDown)
+            return false;
+        if (foregroundSeconds < MinForegroundSeconds) return false;
+        if (idleSeconds < MinIdleSeconds) return false;
+        if (sinceLastAttemptSeconds < MinAttemptCooldownSeconds) return false;
+
+        int effInterval = Math.Max(2, intervalMinutes);
+        bool dueByTime = !hasQuotaTimestamp || quotaAgeMinutes >= effInterval;
+        bool dueByBurn = tokenDeltaSinceLastQuota >= BurnThresholdTokens && quotaAgeMinutes >= 2.0;
+        return dueByTime || dueByBurn;
+    }
+}

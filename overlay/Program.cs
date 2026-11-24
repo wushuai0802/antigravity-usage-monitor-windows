@@ -5,13 +5,13 @@ using System.Reflection;
 using System.Threading;
 using System.Windows;
 
-[assembly: AssemblyVersion("0.2.0.0")]
-[assembly: AssemblyFileVersion("0.2.0.0")]
+[assembly: AssemblyVersion("0.2.1.0")]
+[assembly: AssemblyFileVersion("0.2.1.0")]
 [assembly: AssemblyTitle("Antigravity Usage Monitor (unofficial)")]
 
 internal static class Program
 {
-    internal const string Version = "0.2.0";
+    internal const string Version = "0.2.1";
     private static string _stateDir;
     private static readonly ManualResetEvent StopEvent = new ManualResetEvent(false);
     private static volatile bool _desktopAlive;
@@ -157,21 +157,40 @@ internal static class Program
             {
                 var finder = new AnchorFinder();
                 DateTime lastAutoAttempt = DateTime.MinValue;
+                DateTime foregroundSinceUtc = DateTime.MinValue;
+                IntPtr lastForegroundWindow = IntPtr.Zero;
                 while (!StopEvent.WaitOne(0))
                 {
                     try
                     {
+                        DateTime nowUtc = DateTime.UtcNow;
                         IntPtr w = Interlocked.CompareExchange(ref _window, IntPtr.Zero, IntPtr.Zero);
+                        bool isFg = w != IntPtr.Zero && Native.IsForeground(w);
+                        if (isFg)
+                        {
+                            if (w != lastForegroundWindow || foregroundSinceUtc == DateTime.MinValue)
+                            {
+                                lastForegroundWindow = w;
+                                foregroundSinceUtc = nowUtc;
+                            }
+                        }
+                        else
+                        {
+                            lastForegroundWindow = IntPtr.Zero;
+                            foregroundSinceUtc = DateTime.MinValue;
+                        }
+
                         bool manualQuota = quotaRefreshFlag.WaitOne(0);
                         if (manualQuota)
                         {
                             quotaRefreshFlag.Reset();
                             if (w != IntPtr.Zero && !controller.IsMoving)
                             {
-                                lastAutoAttempt = DateTime.UtcNow;
-                                if (finder.TriggerQuotaRefresh(w, _stateDir))
+                                lastAutoAttempt = nowUtc;
+                                if (finder.TriggerQuotaRefresh(w, _stateDir, false))
                                 {
                                     Interlocked.Exchange(ref lastQuotaTokens, Interlocked.Read(ref latestTodayTokens));
+                                    Interlocked.Exchange(ref lastQuotaUpdatedTicks, DateTime.UtcNow.Ticks);
                                 }
                             }
                         }
@@ -183,29 +202,39 @@ internal static class Program
                             controller.PostAnchor(anchor);
                         }
 
-                        // Guarded idle auto-refresh: only when enabled, user idle >= 45s, no menu/panel open,
+                        // Guarded foreground-only idle auto-refresh:
+                        // never run while Antigravity is in the background or freshly focused (< 15s),
+                        // require >= 45s keyboard/mouse idle, no menu/panel open, no mouse buttons held,
                         // and either interval elapsed or >= 3M new tokens consumed since last quota sync.
-                        if (anchor != null && !anchor.MenuOpen && !controller.IsMoving && !controller.IsPanelOpen
-                            && controller.AutoRefreshQuotaEnabled && Native.IdleSeconds() >= 45.0
-                            && (DateTime.UtcNow - lastAutoAttempt).TotalSeconds >= 90.0)
-                        {
-                            long qTicks = Interlocked.Read(ref lastQuotaUpdatedTicks);
-                            DateTime lastQuotaUtc = qTicks > 0 ? new DateTime(qTicks, DateTimeKind.Utc) : DateTime.MinValue;
-                            double ageMin = (DateTime.UtcNow - lastQuotaUtc).TotalMinutes;
-                            long curTok = Interlocked.Read(ref latestTodayTokens);
-                            long prevTok = Interlocked.Read(ref lastQuotaTokens);
-                            int intervalMin = Math.Max(2, controller.AutoRefreshIntervalMinutes);
-                            bool dueByTime = (qTicks == 0) || ageMin >= intervalMin;
-                            bool dueByBurn = (curTok - prevTok) >= 3000000L && ageMin >= 2.0;
+                        long qTicks = Interlocked.Read(ref lastQuotaUpdatedTicks);
+                        DateTime lastQuotaUtc = qTicks > 0 ? new DateTime(qTicks, DateTimeKind.Utc) : DateTime.MinValue;
+                        double ageMin = qTicks > 0 ? (nowUtc - lastQuotaUtc).TotalMinutes : 0.0;
+                        long curTok = Interlocked.Read(ref latestTodayTokens);
+                        long prevTok = Interlocked.Read(ref lastQuotaTokens);
+                        double fgSec = (isFg && foregroundSinceUtc != DateTime.MinValue) ? (nowUtc - foregroundSinceUtc).TotalSeconds : 0.0;
+                        double sinceAttemptSec = lastAutoAttempt == DateTime.MinValue ? 9999.0 : (nowUtc - lastAutoAttempt).TotalSeconds;
 
-                            if (dueByTime || dueByBurn)
+                        if (AutoRefreshGuard.ShouldTrigger(
+                            controller.AutoRefreshQuotaEnabled,
+                            isFg,
+                            fgSec,
+                            anchor != null,
+                            anchor != null && anchor.MenuOpen,
+                            controller.IsMoving,
+                            controller.IsPanelOpen,
+                            Native.AnyMouseButtonDown(),
+                            Native.IdleSeconds(),
+                            sinceAttemptSec,
+                            qTicks > 0,
+                            ageMin,
+                            controller.AutoRefreshIntervalMinutes,
+                            curTok - prevTok))
+                        {
+                            lastAutoAttempt = nowUtc;
+                            if (finder.TriggerQuotaRefresh(w, _stateDir, true))
                             {
-                                lastAutoAttempt = DateTime.UtcNow;
-                                if (finder.TriggerQuotaRefresh(w, _stateDir))
-                                {
-                                    Interlocked.Exchange(ref lastQuotaTokens, curTok);
-                                    Interlocked.Exchange(ref lastQuotaUpdatedTicks, DateTime.UtcNow.Ticks);
-                                }
+                                Interlocked.Exchange(ref lastQuotaTokens, curTok);
+                                Interlocked.Exchange(ref lastQuotaUpdatedTicks, DateTime.UtcNow.Ticks);
                             }
                         }
                     }

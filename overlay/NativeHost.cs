@@ -65,6 +65,19 @@ internal static class Native
     }
 
     internal static bool Live(IntPtr w) { return w != IntPtr.Zero && IsWindow(w) && IsWindowVisible(w) && !IsIconic(w); }
+    internal static bool IsForeground(IntPtr w) { return Live(w) && GetAncestor(GetForegroundWindow(), 2) == w; }
+    internal static bool AnyMouseButtonDown()
+    {
+        return (GetAsyncKeyState(0x01) & 0x8000) != 0
+            || (GetAsyncKeyState(0x02) & 0x8000) != 0
+            || (GetAsyncKeyState(0x04) & 0x8000) != 0;
+    }
+    internal static bool IsPointOwnedBy(IntPtr owner, double screenX, double screenY)
+    {
+        if (owner == IntPtr.Zero) return false;
+        IntPtr hit = WindowFromPoint(new POINT((int)Math.Round(screenX), (int)Math.Round(screenY)));
+        return hit != IntPtr.Zero && GetAncestor(hit, 2) == owner;
+    }
     internal static double Scale(IntPtr w) { try { return Math.Max(1.0, GetDpiForWindow(w) / 96.0); } catch (EntryPointNotFoundException) { return 1.0; } }
 
     internal static string GetTitle(IntPtr w)
@@ -234,7 +247,7 @@ internal sealed class AnchorFinder
                 _window = window;
                 Search(window, stateDir);
             }
-            if (_webDoc != null) TryOpportunisticQuotaScan(_webDoc, window, stateDir, true);
+            if (_webDoc != null && Native.IsForeground(window)) TryOpportunisticQuotaScan(_webDoc, window, stateDir, true);
             if (_modelButton == null) { Stage = "model-not-found"; return null; }
             if (_modelButton.Current.IsOffscreen) { Invalidate(); Stage = "offscreen"; return null; }
 
@@ -378,7 +391,7 @@ internal sealed class AnchorFinder
         if (bestModel == null)
         {
             _nextSearch = DateTime.UtcNow.AddSeconds(1);
-            TryOpportunisticQuotaScan(_webDoc, window, stateDir, true);
+            if (Native.IsForeground(window)) TryOpportunisticQuotaScan(_webDoc, window, stateDir, true);
             return;
         }
 
@@ -400,7 +413,7 @@ internal sealed class AnchorFinder
             catch { }
         }
 
-        TryOpportunisticQuotaScan(_webDoc, window, stateDir, false);
+        if (Native.IsForeground(window)) TryOpportunisticQuotaScan(_webDoc, window, stateDir, false);
     }
 
     private static readonly System.Windows.Automation.Condition UsageMenuItemCondition = new AndCondition(
@@ -418,9 +431,12 @@ internal sealed class AnchorFinder
             new PropertyCondition(AutomationElement.NameProperty, "Usage")));
 
     // Zero-cursor-move UIA quota sync: Expand model picker -> post WM_MOUSEMOVE over "查看用量" -> read RawView -> Collapse.
-    internal bool TriggerQuotaRefresh(IntPtr window, string stateDir)
+    // When requireForeground is true (automatic background timer), never run unless Antigravity is the active
+    // foreground window, unobstructed at the model button, with no mouse buttons pressed; abort immediately on user activity.
+    internal bool TriggerQuotaRefresh(IntPtr window, string stateDir, bool requireForeground)
     {
         if (!Native.Live(window) || string.IsNullOrEmpty(stateDir)) return false;
+        if (requireForeground && (!Native.IsForeground(window) || Native.AnyMouseButtonDown())) return false;
         try
         {
             if (window != _window || _modelButton == null || _webDoc == null)
@@ -429,6 +445,13 @@ internal sealed class AnchorFinder
                 Search(window, stateDir);
             }
             if (_modelButton == null || _webDoc == null || _modelButton.Current.IsOffscreen) return false;
+            if (requireForeground)
+            {
+                if (!Native.IsForeground(window) || Native.AnyMouseButtonDown() || Native.IdleSeconds() < 45.0) return false;
+                Rect mb = _modelButton.Current.BoundingRectangle;
+                if (mb.IsEmpty || mb.Width <= 0 || mb.Height <= 0) return false;
+                if (!Native.IsPointOwnedBy(window, mb.Left + mb.Width / 2.0, mb.Top + mb.Height / 2.0)) return false;
+            }
 
             object patObj;
             if (!_modelButton.TryGetCurrentPattern(ExpandCollapsePattern.Pattern, out patObj)) return false;
@@ -439,6 +462,8 @@ internal sealed class AnchorFinder
             try
             {
                 System.Threading.Thread.Sleep(160);
+                if (requireForeground && (!Native.IsForeground(window) || Native.AnyMouseButtonDown() || Native.IdleSeconds() < 1.5)) return false;
+
                 var usageItem = _webDoc.FindFirst(TreeScope.Descendants, UsageMenuItemCondition);
                 if (usageItem == null) return false;
 
@@ -458,6 +483,10 @@ internal sealed class AnchorFinder
                 for (int t = 0; t < 15; t++)
                 {
                     System.Threading.Thread.Sleep(120);
+                    if (requireForeground && (!Native.IsForeground(window) || Native.AnyMouseButtonDown() || Native.IdleSeconds() < 1.5))
+                    {
+                        break;
+                    }
                     var usageMenu = _webDoc.FindFirst(TreeScope.Descendants, UsageMenuCondition);
                     if (usageMenu == null) continue;
 

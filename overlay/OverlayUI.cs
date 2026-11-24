@@ -848,7 +848,7 @@ internal sealed class OverlayController
         }
         sp.Children.Add(themeRow);
 
-        sp.Children.Add(SectionHeading("双池配额自动同步（不移动鼠标，键鼠空闲 ≥ 45s 后快闪读取）", pal));
+        sp.Children.Add(SectionHeading("双池配额自动同步（仅 Antigravity 在前台且键鼠空闲 ≥ 45s 时触发）", pal));
         var autoCb = new CheckBox
         {
             Content = "启用空闲自动刷新双池配额",
