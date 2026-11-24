@@ -388,8 +388,8 @@ internal sealed class AnchorFinder
         _nextQuotaScan = DateTime.UtcNow.AddSeconds(2);
         try
         {
-            // Prefer scanning inside an open modal/dialog container so chat transcript text is never read.
-            AutomationElement scopeRoot = FindQuotaDialogScope(root) ?? root;
+            AutomationElement dialogScope = FindQuotaDialogScope(root);
+            AutomationElement scopeRoot = dialogScope ?? root;
             var cond = new OrCondition(
                 new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Text),
                 new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Header));
@@ -401,7 +401,8 @@ internal sealed class AnchorFinder
                 try
                 {
                     var el = nodes[i];
-                    if (el.Current.IsOffscreen) continue;
+                    // Inside an open quota modal, read scrolled-off rows too (e.g. Claude pool below fold).
+                    if (dialogScope == null && el.Current.IsOffscreen) continue;
                     string n = el.Current.Name;
                     if (!string.IsNullOrWhiteSpace(n) && n.Length <= 48) lines.Add(n.Trim());
                 }

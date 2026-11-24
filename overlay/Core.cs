@@ -262,10 +262,10 @@ internal static class UiaQuotaParser
         @"^(模型额度|model\s+quotas?|models?\s*&\s*(?:quota|usage))$",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly Regex ExactGeminiPoolRegex = new Regex(
-        @"^gemini\s*(模型|models?)$",
+        @"^gemini\s*(模型|models?)(?:\s*[^\w\u4e00-\u9fa5]{0,3})?$",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly Regex ExactClaudePoolRegex = new Regex(
-        @"^claude\s*(?:和|and|/|&)\s*(?:gpt|第三方)\s*(模型|models?)?$",
+        @"^claude\s*(?:和|and|/|&)\s*(?:gpt|第三方)\s*(模型|models?)?(?:\s*[^\w\u4e00-\u9fa5]{0,3})?$",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly Regex ExactWeeklyRegex = new Regex(
         @"^(剩余每周限制|每周限制|weekly\s+limit(?:\s+remaining)?|remaining\s+weekly\s+limit)$",

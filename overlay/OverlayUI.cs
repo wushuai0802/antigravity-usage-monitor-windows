@@ -368,7 +368,7 @@ internal sealed class OverlayController
 
         FrameworkElement stripContent = BuildStripElement(fitted, pal);
         stripContent.Measure(new Size(double.PositiveInfinity, double.PositiveInfinity));
-        double wDip = Math.Ceiling(stripContent.DesiredSize.Width);
+        double wDip = Math.Ceiling(stripContent.DesiredSize.Width) + 10.0;
         double hDip = Math.Min(26.0, Math.Max(22.0, _anchor.Height / _anchor.Scale));
         double topPx = _anchor.Top + Math.Max(0, (_anchor.Height - hDip * _anchor.Scale) / 2.0);
         Rect place = OverlayLayout.PlaceInRange(_anchor.FreeLeft, _anchor.FreeRight, topPx, wDip, hDip, _anchor.Scale);
@@ -404,7 +404,7 @@ internal sealed class OverlayController
     {
         var el = BuildStripElement(items, pal);
         el.Measure(new Size(double.PositiveInfinity, double.PositiveInfinity));
-        return Math.Ceiling(el.DesiredSize.Width);
+        return Math.Ceiling(el.DesiredSize.Width) + 10.0;
     }
 
     private FrameworkElement BuildStripElement(List<StripItem> items, ThemePalette pal)
@@ -440,10 +440,12 @@ internal sealed class OverlayController
             BorderBrush = pal.StripBorder,
             BorderThickness = new Thickness(1),
             CornerRadius = new CornerRadius(6),
-            Padding = new Thickness(8, 2, 8, 2),
+            Padding = new Thickness(10, 2, 12, 2),
             Cursor = Cursors.Hand,
             Child = sp
         };
+        TextOptions.SetTextFormattingMode(border, TextFormattingMode.Display);
+        TextOptions.SetTextRenderingMode(border, TextRenderingMode.ClearType);
         border.MouseEnter += (s, e) => { _hoverStrip = true; border.Background = pal.StripHover; };
         border.MouseLeave += (s, e) => { _hoverStrip = false; border.Background = pal.StripBg; };
         border.MouseLeftButtonUp += (s, e) =>
@@ -586,7 +588,10 @@ internal sealed class OverlayController
         {
             if (q.Gemini != null) sp.Children.Add(BuildPoolBlock("Gemini 池", q.Gemini, pal.AccentGemini, pal));
             if (q.Claude != null) sp.Children.Add(BuildPoolBlock("Claude / 第三方池", q.Claude, pal.AccentClaude, pal));
-            sp.Children.Add(MakeKv("数据来源", string.IsNullOrEmpty(q.Source) ? "--" : q.Source, pal, pal.InkMuted));
+            TimeSpan age = DateTime.UtcNow - q.UpdatedAtUtc;
+            string ageText = age.TotalMinutes < 1.0 ? "刚刚" : (age.TotalHours < 1.0 ? ((int)age.TotalMinutes + "分钟前") : ((int)age.TotalHours + "小时前"));
+            string srcLabel = (string.IsNullOrEmpty(q.Source) ? "--" : q.Source) + " · " + ageText;
+            sp.Children.Add(MakeKv("数据来源", srcLabel, pal, age.TotalMinutes >= 30.0 ? pal.WarnBrush : pal.InkMuted));
         }
 
         sp.Children.Add(new Border { Height = 1, Background = pal.PanelBorder, Margin = new Thickness(0, 8, 0, 8) });
