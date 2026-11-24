@@ -388,51 +388,65 @@ internal sealed class AnchorFinder
         TryOpportunisticQuotaScan(_webDoc, window, stateDir, false);
     }
 
-    private static readonly System.Windows.Automation.Condition QuotaAnchorCondition = new OrCondition(
-        new PropertyCondition(AutomationElement.NameProperty, "5 小时限额"),
+    private static readonly System.Windows.Automation.Condition UsageMenuCondition = new AndCondition(
+        new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Menu),
+        new OrCondition(
+            new PropertyCondition(AutomationElement.NameProperty, "查看用量"),
+            new PropertyCondition(AutomationElement.NameProperty, "使用量"),
+            new PropertyCondition(AutomationElement.NameProperty, "View usage"),
+            new PropertyCondition(AutomationElement.NameProperty, "Usage")));
+    private static readonly System.Windows.Automation.Condition ModalAnchorCondition = new OrCondition(
         new PropertyCondition(AutomationElement.NameProperty, "剩余五小时限制"),
-        new PropertyCondition(AutomationElement.NameProperty, "周限额"),
         new PropertyCondition(AutomationElement.NameProperty, "剩余每周限制"),
-        new PropertyCondition(AutomationElement.NameProperty, "5-hour limit"),
-        new PropertyCondition(AutomationElement.NameProperty, "Weekly limit"));
+        new PropertyCondition(AutomationElement.NameProperty, "模型额度"),
+        new PropertyCondition(AutomationElement.NameProperty, "Model quotas"));
     private string _lastSavedQuotaSummary = "";
 
     private void TryOpportunisticQuotaScan(AutomationElement webDoc, IntPtr window, string stateDir, bool fastMode)
     {
         if (webDoc == null || string.IsNullOrEmpty(stateDir) || DateTime.UtcNow < _nextQuotaScan) return;
-        _nextQuotaScan = DateTime.UtcNow.AddMilliseconds(fastMode ? 450 : 900);
+        _nextQuotaScan = DateTime.UtcNow.AddMilliseconds(fastMode ? 350 : 800);
         try
         {
+            // Fast path 1 (verified via FromPoint): model-menu "查看用量" submenu mounts as ControlType.Menu
+            // whose children are flagged IsOffscreen=True by Chromium due to portal wrapper geometry.
+            // Scanning its ~20 raw nodes takes < 5ms and never touches chat content.
+            var usageMenu = webDoc.FindFirst(TreeScope.Descendants, UsageMenuCondition);
+            if (usageMenu != null)
+            {
+                var lines = new List<string>();
+                CollectLinesFaultTolerant(usageMenu, lines, 120, true);
+                if (TryCommitQuotaLines(lines, stateDir)) return;
+            }
+
+            // Also scan any open ControlType.Menu under composer box (covers localized labels).
+            var composerBox = webDoc.FindFirst(TreeScope.Descendants, new PropertyCondition(AutomationElement.AutomationIdProperty, "antigravity.agentSidePanelInputBox"));
+            if (composerBox != null)
+            {
+                var menus = composerBox.FindAll(TreeScope.Descendants, new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Menu));
+                for (int i = menus.Count - 1; i >= 0; i--)
+                {
+                    var lines = new List<string>();
+                    CollectLinesFaultTolerant(menus[i], lines, 200, true);
+                    if (TryCommitQuotaLines(lines, stateDir)) return;
+                }
+            }
+
+            // Fast path 2: settings "模型额度" modal (climb from visible modal anchor smallest-first).
             Native.RECT frame;
             if (!Native.GetWindowRect(window, out frame)) return;
             double scale = Native.Scale(window);
-
-            // Single fast native UIA query inside Electron Document only (never touches our owned WPF overlay window).
-            var anchors = webDoc.FindAll(TreeScope.Descendants, QuotaAnchorCondition);
+            var anchors = webDoc.FindAll(TreeScope.Descendants, ModalAnchorCondition);
             if (anchors == null || anchors.Count == 0) return;
 
-            var visibleAnchors = new List<AutomationElement>();
+            var walker = TreeWalker.ControlViewWalker;
             for (int i = anchors.Count - 1; i >= 0; i--)
             {
-                try
-                {
-                    var el = anchors[i];
-                    if (!el.Current.IsOffscreen) visibleAnchors.Add(el);
-                }
-                catch { }
-                if (visibleAnchors.Count >= 4) break;
-            }
-            if (visibleAnchors.Count == 0) return;
-
-            // Climb via geometry ONLY (zero nested FindAll calls!) and keep candidates SMALLEST-FIRST
-            // so the tight popover/modal card is scanned before any outer chat wrapper!
-            var walker = TreeWalker.ControlViewWalker;
-            var candidates = new List<AutomationElement>();
-            foreach (var anchor in visibleAnchors)
-            {
-                AutomationElement cur = anchor;
-                int addedForAnchor = 0;
-                for (int d = 0; d < 12 && cur != null && addedForAnchor < 4; d++)
+                AutomationElement el = anchors[i];
+                try { if (el.Current.IsOffscreen) continue; } catch { continue; }
+                AutomationElement cur = el;
+                int tried = 0;
+                for (int d = 0; d < 10 && cur != null && tried < 3; d++)
                 {
                     if (cur == webDoc) break;
                     try
@@ -440,53 +454,17 @@ internal sealed class AnchorFinder
                         string aid = cur.Current.AutomationId ?? "";
                         if (string.Equals(aid, "root", StringComparison.OrdinalIgnoreCase)) break;
                         Rect r = cur.Current.BoundingRectangle;
-                        if (!r.IsEmpty && r.Width >= 220 * scale && r.Height >= 150 * scale
+                        if (!r.IsEmpty && r.Width >= 240 * scale && r.Height >= 180 * scale
                             && r.Width <= frame.Width * 0.92 && r.Height <= frame.Height * 0.92)
                         {
-                            if (!candidates.Contains(cur))
-                            {
-                                candidates.Add(cur);
-                                addedForAnchor++;
-                            }
+                            tried++;
+                            var lines = new List<string>();
+                            CollectLinesFaultTolerant(cur, lines, 360, true);
+                            if (TryCommitQuotaLines(lines, stateDir)) return;
                         }
                     }
                     catch { break; }
                     try { cur = walker.GetParent(cur); } catch { break; }
-                }
-            }
-
-            PoolQuotaState bestG = null, bestC = null;
-            int bestScore = 0;
-            foreach (var card in candidates)
-            {
-                var lines = new List<string>();
-                CollectLinesFaultTolerant(card, lines, 450);
-                if (lines.Count == 0) continue;
-                PoolQuotaState g, c;
-                if (UiaQuotaParser.TryParseFromLines(lines, DateTime.UtcNow, out g, out c))
-                {
-                    int score = (g != null ? (g.FiveHour != null && g.Weekly != null ? 2 : 1) : 0)
-                              + (c != null ? (c.FiveHour != null && c.Weekly != null ? 2 : 1) : 0);
-                    if (score > bestScore)
-                    {
-                        bestScore = score;
-                        bestG = g;
-                        bestC = c;
-                    }
-                    if (bestScore >= 4) break;
-                }
-            }
-
-            if (bestG != null || bestC != null)
-            {
-                DualSlotStore.WriteQuotaFromUia(stateDir, bestG, bestC, DateTime.UtcNow);
-                string summary = string.Format("G={0} C={1}",
-                    bestG == null ? "null" : (bestG.RemainingPct + "%(5h=" + (bestG.FiveHour != null ? bestG.FiveHour.RemainingPct.ToString() : "-") + ",7d=" + (bestG.Weekly != null ? bestG.Weekly.RemainingPct.ToString() : "-") + ")"),
-                    bestC == null ? "null" : (bestC.RemainingPct + "%(5h=" + (bestC.FiveHour != null ? bestC.FiveHour.RemainingPct.ToString() : "-") + ",7d=" + (bestC.Weekly != null ? bestC.Weekly.RemainingPct.ToString() : "-") + ")"));
-                if (summary != _lastSavedQuotaSummary)
-                {
-                    _lastSavedQuotaSummary = summary;
-                    Program.Note("quota-uia-saved: " + summary);
                 }
             }
         }
@@ -536,9 +514,9 @@ internal sealed class AnchorFinder
         return true;
     }
 
-    private static void CollectLinesFaultTolerant(AutomationElement root, List<string> output, int maxNodes)
+    private static void CollectLinesFaultTolerant(AutomationElement root, List<string> output, int maxNodes, bool useRawWalker = false)
     {
-        var walker = TreeWalker.ControlViewWalker;
+        var walker = useRawWalker ? TreeWalker.RawViewWalker : TreeWalker.ControlViewWalker;
         var stack = new Stack<AutomationElement>();
         stack.Push(root);
         int visited = 0;

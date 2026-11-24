@@ -186,6 +186,38 @@ internal static class OverlayTests
         Assert(sc.Weekly != null && Math.Abs(sc.Weekly.RemainingPct - 48.0) < 0.01 && sc.Weekly.ResetAtUtc.HasValue, "Split Claude 7d should be 48% with reset");
         Assert(sc.FiveHour != null && Math.Abs(sc.FiveHour.RemainingPct - 0.0) < 0.01 && sc.FiveHour.ResetAtUtc.HasValue, "Split Claude 5h should be 0% with reset");
 
+        // Verify exact FromPoint RawView capture from real Antigravity 2.0 "(Menu)[查看用量]"
+        var exactCapturedLines = new[]
+        {
+            "查看用量",
+            "使用量",
+            "Gemini 模型",
+            "Gemini 模型",
+            "周限额",
+            "94",
+            "% 剩余",
+            "6 天 15 小时 后重置",
+            "5 小时限额",
+            "77",
+            "% 剩余",
+            "1 小时 8 分钟 后重置",
+            "Claude 和 GPT 模型",
+            "Claude 和 GPT 模型",
+            "周限额",
+            "100",
+            "% 剩余",
+            "5 小时限额",
+            "100",
+            "% 剩余"
+        };
+        PoolQuotaState eg, ec;
+        bool exactOk = UiaQuotaParser.TryParseFromLines(exactCapturedLines, now, out eg, out ec);
+        Assert(exactOk && eg != null && ec != null, "Exact FromPoint captured submenu lines must parse both pools");
+        Assert(eg.Weekly != null && Math.Abs(eg.Weekly.RemainingPct - 94.0) < 0.01, "Exact Gemini 7d should be 94%");
+        Assert(eg.FiveHour != null && Math.Abs(eg.FiveHour.RemainingPct - 77.0) < 0.01, "Exact Gemini 5h should be 77%");
+        Assert(ec.Weekly != null && Math.Abs(ec.Weekly.RemainingPct - 100.0) < 0.01 && ec.Weekly.CountdownText == "满额", "Exact Claude 7d should be 100%");
+        Assert(ec.FiveHour != null && Math.Abs(ec.FiveHour.RemainingPct - 100.0) < 0.01 && ec.FiveHour.CountdownText == "满额", "Exact Claude 5h should be 100%");
+
         // Guard: ordinary chat lines mentioning quota keywords and percentages must NOT be misread
         var chatLines = new[]
         {
