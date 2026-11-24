@@ -22,6 +22,8 @@ internal static class OverlayTests
         TestUiaQuotaParser();
         TestNarrowPriorityTrim();
         TestDualSlotQuotaRoundTrip();
+        TestBurnRateAndAccountSwitchBoundary();
+        TestMilestoneDeduplication();
         Console.WriteLine("C# OverlayTests passed: " + _passed + " assertions.");
         return 0;
     }
@@ -273,6 +275,66 @@ internal static class OverlayTests
             Assert(snap.Quota != null && snap.Quota.Gemini != null && snap.Quota.Claude != null, "Should reload dual-slot quota snapshot");
             Assert(MetricFormatter.FormatCompactQuota(snap.Quota, "gemini") == "G 25% · C 12%", "Gemini active should place G first");
             Assert(MetricFormatter.FormatCompactQuota(snap.Quota, "claude") == "C 12% · G 25%", "Claude active should place C first");
+        }
+        finally
+        {
+            if (Directory.Exists(tmp)) Directory.Delete(tmp, true);
+        }
+    }
+
+    private static void TestBurnRateAndAccountSwitchBoundary()
+    {
+        var t0 = new DateTime(2026, 11, 24, 3, 0, 0, DateTimeKind.Utc);
+        var resetA = t0.AddHours(3);
+        var resetB = t0.AddHours(4);
+
+        // Old account burned quickly from 50% -> 10% in 1h, then switched to Account B (90% -> 70% in 1h)
+        var series = new List<QuotaHistorySample>
+        {
+            new QuotaHistorySample { AtUtc = t0, RemainingPct = 50.0, ResetAtUtc = resetA, Boundary = true },
+            new QuotaHistorySample { AtUtc = t0.AddHours(1), RemainingPct = 10.0, ResetAtUtc = resetA, Boundary = false },
+            // Account switch boundary: quota jumped back up + reset time shifted
+            new QuotaHistorySample { AtUtc = t0.AddHours(1).AddMinutes(5), RemainingPct = 90.0, ResetAtUtc = resetB, Boundary = true },
+            new QuotaHistorySample { AtUtc = t0.AddHours(2).AddMinutes(5), RemainingPct = 70.0, ResetAtUtc = resetB, Boundary = false }
+        };
+
+        Assert(QuotaHistoryStore.IsBoundaryTransition(series[1], 90.0, resetB), "Upward jump / shifted reset must detect boundary");
+        Assert(!QuotaHistoryStore.IsBoundaryTransition(series[2], 70.0, resetB.AddMinutes(1)), "Normal burn with 1m jitter must not trigger boundary");
+
+        var curB = QuotaEvaluator.Evaluate("gemini", 70.0, resetB, t0.AddHours(2).AddMinutes(5));
+        var burn = QuotaHistoryStore.ComputeBurnRate(series, curB, t0.AddHours(2).AddMinutes(5));
+        Assert(burn != null && Math.Abs(burn.PctPerHour - 20.0) < 0.2, "Burn rate must isolate post-boundary Account B (~20%/h)");
+        Assert(!burn.WillExhaustBeforeReset, "70% at 20%/h (3.5h runway) must safely survive remaining ~1.9h until reset");
+
+        // Fast burn scenario: 20% left at 20%/h = 1h runway, but 2.5h until reset -> warns early exhaustion
+        var curFast = QuotaEvaluator.Evaluate("claude", 20.0, t0.AddHours(4).AddMinutes(35), t0.AddHours(2).AddMinutes(5));
+        var burnFast = QuotaHistoryStore.ComputeBurnRate(series, curFast, t0.AddHours(2).AddMinutes(5));
+        Assert(burnFast != null && burnFast.WillExhaustBeforeReset, "1h runway with 2.5h left must flag exhaustion before reset");
+    }
+
+    private static void TestMilestoneDeduplication()
+    {
+        string tmp = Path.Combine(Path.GetTempPath(), "agy-milestone-test-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            var now = new DateTime(2026, 11, 24, 3, 0, 0, DateTimeKind.Utc);
+            var tracker = new MilestoneTracker(tmp);
+            var q1 = new QuotaSnapshot { Gemini = QuotaEvaluator.Evaluate("gemini", 18.0, now.AddHours(2), now) };
+            var ev1 = tracker.Evaluate(q1);
+            Assert(ev1.Count == 1 && ev1[0].ThresholdPct == 20, "Crossing <=20% in 5h must fire one 20% alert");
+
+            // Same cycle, still 16% -> must NOT repeat
+            var q2 = new QuotaSnapshot { Gemini = QuotaEvaluator.Evaluate("gemini", 16.0, now.AddHours(2).AddMinutes(1), now) };
+            Assert(tracker.Evaluate(q2).Count == 0, "Same cycle above 10% must not re-fire 20% alert");
+
+            // Drops to 8% -> fires 10% alert once
+            var q3 = new QuotaSnapshot { Gemini = QuotaEvaluator.Evaluate("gemini", 8.0, now.AddHours(2), now) };
+            var ev3 = tracker.Evaluate(q3);
+            Assert(ev3.Count == 1 && ev3[0].ThresholdPct == 10 && ev3[0].Critical, "Crossing <=10% in 5h must fire critical 10% alert");
+
+            // Next 5h cycle (reset time shifted by 2h, still <=6h so 5h window) -> allowed to alert again
+            var qNext = new QuotaSnapshot { Gemini = QuotaEvaluator.Evaluate("gemini", 15.0, now.AddHours(4), now) };
+            Assert(tracker.Evaluate(qNext).Count == 1, "New reset cycle must allow milestone alert again");
         }
         finally
         {

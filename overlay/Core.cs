@@ -27,6 +27,7 @@ internal sealed class PoolQuotaState
     // Optional secondary window when both 5h and 7d limits are available (e.g. from Antigravity "模型额度" page)
     internal PoolQuotaState FiveHour;
     internal PoolQuotaState Weekly;
+    internal BurnRateEstimate BurnRate;
 }
 
 internal sealed class QuotaSnapshot
@@ -63,6 +64,8 @@ internal sealed class SessionStats
     internal long CacheReadTokens;
     internal long OutputTokens;
     internal double? CacheHitRate;
+    internal double? LastTurnCacheHitRate;
+    internal bool CacheCollapsed;
     internal long LastTurnTokens;
     internal long LastTurnOutputTokens;
     internal long? LastTurnDurationMs;
@@ -84,6 +87,7 @@ internal sealed class MonitorSnapshot
     internal string SourceEnv;
     internal string ActiveConversationId;
     internal TodayStats Today;
+    internal List<DailyUsagePoint> DailyHistory;
     internal Dictionary<string, SessionStats> Sessions;
     internal QuotaSnapshot Quota;
 
@@ -136,6 +140,8 @@ internal sealed class OverlaySettings
     internal List<string> Priority;
     internal bool AutoRefreshQuota;
     internal int AutoRefreshIntervalMinutes;
+    internal bool EnableMilestoneAlerts;
+    internal bool ShowTrendChart;
 
     internal static OverlaySettings CreateDefault()
     {
@@ -146,6 +152,8 @@ internal sealed class OverlaySettings
         s.Priority = new List<string>(DefaultPriority);
         s.AutoRefreshQuota = true;
         s.AutoRefreshIntervalMinutes = 10;
+        s.EnableMilestoneAlerts = true;
+        s.ShowTrendChart = true;
         return s;
     }
 
@@ -177,6 +185,16 @@ internal sealed class OverlaySettings
                 {
                     def.AutoRefreshIntervalMinutes = mins;
                 }
+            }
+            object alertObj;
+            if (raw.TryGetValue("enableMilestoneAlerts", out alertObj) && alertObj is bool)
+            {
+                def.EnableMilestoneAlerts = (bool)alertObj;
+            }
+            object trendObj;
+            if (raw.TryGetValue("showTrendChart", out trendObj) && trendObj is bool)
+            {
+                def.ShowTrendChart = (bool)trendObj;
             }
             object visObj;
             if (raw.TryGetValue("visible", out visObj) && visObj is Dictionary<string, object>)
@@ -216,6 +234,8 @@ internal sealed class OverlaySettings
                 { "themeMode", ThemeMode },
                 { "autoRefreshQuota", AutoRefreshQuota },
                 { "autoRefreshIntervalMinutes", AutoRefreshIntervalMinutes },
+                { "enableMilestoneAlerts", EnableMilestoneAlerts },
+                { "showTrendChart", ShowTrendChart },
                 { "visible", Visible },
                 { "priority", Priority.ToArray() }
             };
@@ -657,6 +677,8 @@ internal static class DualSlotStore
                         CacheReadTokens = GetLong(sm, "cacheReadTokens", 0),
                         OutputTokens = GetLong(sm, "outputTokens", 0),
                         CacheHitRate = GetNullableDouble(sm, "cacheHitRate"),
+                        LastTurnCacheHitRate = GetNullableDouble(sm, "lastTurnCacheHitRate"),
+                        CacheCollapsed = GetBool(sm, "cacheCollapsed", false),
                         LastTurnTokens = GetLong(sm, "lastTurnTokens", 0),
                         LastTurnOutputTokens = GetLong(sm, "lastTurnOutputTokens", 0),
                         LastTurnDurationMs = GetNullableLong(sm, "lastTurnDurationMs"),
@@ -673,6 +695,21 @@ internal static class DualSlotStore
                     snap.Sessions[s.ConversationId] = s;
                 }
             }
+            object histObj;
+            if (mdoc.TryGetValue("dailyHistory", out histObj) && histObj is object[])
+            {
+                snap.DailyHistory = new List<DailyUsagePoint>();
+                foreach (object o in (object[])histObj)
+                {
+                    var dm = o as Dictionary<string, object>;
+                    if (dm == null) continue;
+                    snap.DailyHistory.Add(new DailyUsagePoint
+                    {
+                        Date = GetStr(dm, "date", ""),
+                        TotalTokens = GetLong(dm, "totalTokens", 0)
+                    });
+                }
+            }
         }
 
         // Prefer high-trust agy-statusline quota; fall back to isolated UIA quota when newer or primary is absent.
@@ -685,6 +722,12 @@ internal static class DualSlotStore
         else
         {
             snap.Quota = primaryQuota ?? uiaQuota;
+        }
+
+        if (snap.Quota != null)
+        {
+            QuotaHistoryStore.RecordSnapshot(stateDir, snap.Quota, snap.Quota.UpdatedAtUtc);
+            QuotaHistoryStore.EnrichBurnRates(stateDir, snap.Quota, nowUtc);
         }
 
         return snap;

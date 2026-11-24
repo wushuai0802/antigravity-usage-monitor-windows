@@ -377,10 +377,14 @@ def parse_transcript(transcript_path: Path, today_local_date: dt.date, local_tz:
             "todayCacheReadTokens": 0,
             "todayOutputTokens": 0,
             "todayTotalTokens": 0,
+            "dailyTotals": {},
             "lastStepIndex": -1,
             "lastModel": "",
             "lastTurnTokens": 0,
+            "lastTurnInputTokens": 0,
+            "lastTurnCacheReadTokens": 0,
             "lastTurnOutputTokens": 0,
+            "lastTurnCacheHitRate": None,
             "estimatedTurnDurationMs": None,
             "contextTokens": 0,
             "lastModifiedAt": latest_ts,
@@ -395,19 +399,27 @@ def parse_transcript(transcript_path: Path, today_local_date: dt.date, local_tz:
     today_in = 0
     today_cache = 0
     today_out = 0
+    daily_totals: dict[str, int] = {}
+    cutoff_date = today_local_date - dt.timedelta(days=30)
 
     for st in ordered_steps:
         i_t = st["inputTokens"]
         c_t = st["cacheReadTokens"]
         o_t = st["outputTokens"]
+        step_total = i_t + c_t + o_t
         total_in += i_t
         total_cache += c_t
         total_out += o_t
         ts = st["createdAt"]
-        if ts is not None and ts.astimezone(local_tz).date() == today_local_date:
-            today_in += i_t
-            today_cache += c_t
-            today_out += o_t
+        if ts is not None:
+            local_d = ts.astimezone(local_tz).date()
+            if local_d >= cutoff_date:
+                dkey = local_d.isoformat()
+                daily_totals[dkey] = daily_totals.get(dkey, 0) + step_total
+            if local_d == today_local_date:
+                today_in += i_t
+                today_cache += c_t
+                today_out += o_t
 
     last = ordered_steps[-1]
     last_idx = last["stepIndex"]
@@ -422,6 +434,9 @@ def parse_transcript(transcript_path: Path, today_local_date: dt.date, local_tz:
             if MIN_TURN_DURATION_MS <= delta_ms <= MAX_ESTIMATED_GAP_MS:
                 estimated_ms = delta_ms
 
+    last_in_plus_cache = last["inputTokens"] + last["cacheReadTokens"]
+    last_hit_rate = round(last["cacheReadTokens"] / last_in_plus_cache, 4) if last_in_plus_cache > 0 else None
+
     return {
         "sessionTokens": total_in + total_cache + total_out,
         "inputTokens": total_in,
@@ -431,10 +446,14 @@ def parse_transcript(transcript_path: Path, today_local_date: dt.date, local_tz:
         "todayCacheReadTokens": today_cache,
         "todayOutputTokens": today_out,
         "todayTotalTokens": today_in + today_cache + today_out,
+        "dailyTotals": daily_totals,
         "lastStepIndex": last_idx,
         "lastModel": last["model"],
         "lastTurnTokens": last["inputTokens"] + last["cacheReadTokens"] + last["outputTokens"],
+        "lastTurnInputTokens": last["inputTokens"],
+        "lastTurnCacheReadTokens": last["cacheReadTokens"],
         "lastTurnOutputTokens": last["outputTokens"],
+        "lastTurnCacheHitRate": last_hit_rate,
         "estimatedTurnDurationMs": estimated_ms,
         "contextTokens": last["inputTokens"] + last["cacheReadTokens"],
         "lastModifiedAt": last_ts or latest_ts,
@@ -486,10 +505,10 @@ def collect_snapshot(
                     continue
                 entries.append((mtime, child.name, tpath))
         entries.sort(key=lambda x: x[0], reverse=True)
-        # Scan all conversations touched within last 48h plus at least top 32 most recent
-        cutoff_epoch = now.timestamp() - 48 * 3600
+        # Scan all conversations touched within last 14 days (for daily trend) plus at least top 48 most recent
+        cutoff_epoch = now.timestamp() - 14 * 24 * 3600
         for idx, (mtime, cid, tpath) in enumerate(entries):
-            if idx < 32 or mtime >= cutoff_epoch or cid == active_cid:
+            if idx < 48 or mtime >= cutoff_epoch or cid == active_cid:
                 candidate_paths[cid] = tpath
 
     parsed_by_cid: dict[str, dict[str, Any]] = {}
@@ -497,12 +516,15 @@ def collect_snapshot(
     today_cache = 0
     today_out = 0
     today_sessions = 0
+    daily_agg: dict[str, int] = {}
 
     for cid, tpath in candidate_paths.items():
         parsed = parse_transcript(tpath, today_local, local_tz)
         if parsed is None:
             continue
         parsed_by_cid[cid] = parsed
+        for dkey, dval in parsed.get("dailyTotals", {}).items():
+            daily_agg[dkey] = daily_agg.get(dkey, 0) + dval
         if parsed["todayTotalTokens"] > 0:
             today_in += parsed["todayInputTokens"]
             today_cache += parsed["todayCacheReadTokens"]
@@ -535,6 +557,16 @@ def collect_snapshot(
 
         in_plus_cache = parsed["inputTokens"] + parsed["cacheReadTokens"]
         hit_rate = round(parsed["cacheReadTokens"] / in_plus_cache, 4) if in_plus_cache > 0 else None
+        last_hit_rate = parsed.get("lastTurnCacheHitRate")
+        last_in_total = parsed.get("lastTurnInputTokens", 0) + parsed.get("lastTurnCacheReadTokens", 0)
+        # Detect prompt cache collapse: warm session (>=65% hit rate) suddenly drops below 35% on a large (>=30K) prompt
+        cache_collapsed = bool(
+            hit_rate is not None
+            and last_hit_rate is not None
+            and hit_rate >= 0.65
+            and last_hit_rate < 0.35
+            and last_in_total >= 30_000
+        )
 
         # Turn timing & tok/s
         turn_rec = timing_turns.get(cid) if isinstance(timing_turns, dict) else None
@@ -574,6 +606,8 @@ def collect_snapshot(
             "cacheReadTokens": parsed["cacheReadTokens"],
             "outputTokens": parsed["outputTokens"],
             "cacheHitRate": hit_rate,
+            "lastTurnCacheHitRate": last_hit_rate,
+            "cacheCollapsed": cache_collapsed,
             "lastTurnTokens": parsed["lastTurnTokens"],
             "lastTurnOutputTokens": parsed["lastTurnOutputTokens"],
             "lastTurnDurationMs": last_dur_ms,
@@ -597,6 +631,43 @@ def collect_snapshot(
     today_in_plus_cache = today_in + today_cache
     today_hit_rate = round(today_cache / today_in_plus_cache, 4) if today_in_plus_cache > 0 else None
 
+    # Persist 31-day numeric-only daily ledger in usage-history.json and expose last 14 days in snapshot
+    usage_history_path = state_dir / "usage-history.json"
+    merged_daily: dict[str, int] = {}
+    if usage_history_path.is_file():
+        try:
+            old_hist = json.loads(usage_history_path.read_text(encoding="utf-8"))
+            if isinstance(old_hist, dict) and isinstance(old_hist.get("daily"), dict):
+                for k, v in old_hist["daily"].items():
+                    if isinstance(k, str) and isinstance(v, int) and v >= 0:
+                        merged_daily[k] = v
+        except (OSError, ValueError):
+            pass
+    for dkey, dval in daily_agg.items():
+        merged_daily[dkey] = max(merged_daily.get(dkey, 0), dval)
+    # Keep last 31 local calendar days
+    min_keep = (today_local - dt.timedelta(days=30)).isoformat()
+    merged_daily = {k: v for k, v in sorted(merged_daily.items()) if k >= min_keep}
+    try:
+        state_dir.mkdir(parents=True, exist_ok=True)
+        fd, tmp_hist = tempfile.mkstemp(prefix=".usage-history.", suffix=".tmp", dir=str(state_dir))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
+                json.dump({"schemaVersion": 1, "updatedAt": format_iso_utc(now), "daily": merged_daily}, fh, ensure_ascii=False, separators=(",", ":"))
+            os.replace(tmp_hist, usage_history_path)
+        except OSError:
+            try:
+                os.unlink(tmp_hist)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+    daily_series = []
+    for offset in range(13, -1, -1):
+        dstr = (today_local - dt.timedelta(days=offset)).isoformat()
+        daily_series.append({"date": dstr, "totalTokens": merged_daily.get(dstr, 0)})
+
     return {
         "schemaVersion": SCHEMA_VERSION,
         "updatedAt": format_iso_utc(now),
@@ -611,6 +682,7 @@ def collect_snapshot(
             "cacheHitRate": today_hit_rate,
             "sessionsCount": today_sessions,
         },
+        "dailyHistory": daily_series,
         "sessions": sessions_map,
     }
 

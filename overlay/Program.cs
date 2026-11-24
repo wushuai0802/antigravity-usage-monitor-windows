@@ -5,13 +5,13 @@ using System.Reflection;
 using System.Threading;
 using System.Windows;
 
-[assembly: AssemblyVersion("0.1.0.0")]
-[assembly: AssemblyFileVersion("0.1.0.0")]
+[assembly: AssemblyVersion("0.2.0.0")]
+[assembly: AssemblyFileVersion("0.2.0.0")]
 [assembly: AssemblyTitle("Antigravity Usage Monitor (unofficial)")]
 
 internal static class Program
 {
-    internal const string Version = "0.1.0";
+    internal const string Version = "0.2.0";
     private static string _stateDir;
     private static readonly ManualResetEvent StopEvent = new ManualResetEvent(false);
     private static volatile bool _desktopAlive;
@@ -130,6 +130,7 @@ internal static class Program
             long lastQuotaTokens = 0;
             long lastQuotaUpdatedTicks = 0;
             var controller = new OverlayController(_stateDir, () => refreshFlag.Set(), () => quotaRefreshFlag.Set());
+            app.Exit += (s, e) => controller.DisposeResources();
 
             // 1. Track Antigravity host process & active main window
             Worker(() =>
@@ -218,6 +219,7 @@ internal static class Program
             {
                 DateTime lastFallback = DateTime.MinValue;
                 int failStreak = 0;
+                var milestones = new MilestoneTracker(_stateDir);
                 while (!StopEvent.WaitOne(0))
                 {
                     if (!_desktopAlive)
@@ -244,7 +246,15 @@ internal static class Program
                             snap = DualSlotStore.LoadSnapshot(_stateDir, DateTime.UtcNow);
                         }
                         if (snap.Today != null) Interlocked.Exchange(ref latestTodayTokens, snap.Today.TotalTokens);
-                        if (snap.Quota != null) Interlocked.Exchange(ref lastQuotaUpdatedTicks, snap.Quota.UpdatedAtUtc.Ticks);
+                        if (snap.Quota != null)
+                        {
+                            Interlocked.Exchange(ref lastQuotaUpdatedTicks, snap.Quota.UpdatedAtUtc.Ticks);
+                            if (controller.MilestoneAlertsEnabled)
+                            {
+                                var alerts = milestones.Evaluate(snap.Quota);
+                                foreach (var ev in alerts) controller.ShowMilestoneToast(ev);
+                            }
+                        }
                         controller.PostSnapshot(snap);
                     }
                     catch (Exception ex) { Note("polling: " + ex.GetType().Name); }

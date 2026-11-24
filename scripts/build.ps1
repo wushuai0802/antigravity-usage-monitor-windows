@@ -19,6 +19,7 @@ $arguments = @(
   '/nologo', '/codepage:65001', "/target:$Target", '/platform:x64', '/optimize+', "/out:$Output",
   "/win32manifest:$(Join-Path $PSScriptRoot '..\overlay\app.manifest')",
   '/r:System.Core.dll', '/r:System.Web.Extensions.dll',
+  '/r:System.Windows.Forms.dll', '/r:System.Drawing.dll',
   "/r:$framework\WPF\UIAutomationClient.dll",
   "/r:$framework\WPF\UIAutomationTypes.dll",
   "/r:$framework\WPF\WindowsBase.dll",

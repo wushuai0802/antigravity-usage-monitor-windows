@@ -174,6 +174,28 @@ class CollectorTests(unittest.TestCase):
         self.assertIn("G 25%", line)
         self.assertIn("C 12%", line)
 
+    def test_cache_collapse_detection_and_daily_history(self) -> None:
+        now = dt.datetime(2026, 11, 24, 5, 0, 0, tzinfo=dt.timezone.utc)
+        write_jsonl(
+            self.app_dir / "brain" / "collapse-1" / ".system_generated" / "logs" / "transcript.jsonl",
+            [
+                # Warm cache turns
+                {"step_index": 1, "type": "PLANNER_RESPONSE", "created_at": "2026-11-23T05:00:00Z", "model": "gemini-4-neon-high", "input_tokens": 5000, "cache_read_tokens": 95000, "output_tokens": 400},
+                {"step_index": 2, "type": "PLANNER_RESPONSE", "created_at": "2026-11-24T04:50:00Z", "model": "gemini-4-neon-high", "input_tokens": 5000, "cache_read_tokens": 145000, "output_tokens": 500},
+                # Sudden cache collapse on a 60K prompt (0% cache read)
+                {"step_index": 3, "type": "PLANNER_RESPONSE", "created_at": "2026-11-24T04:59:00Z", "model": "gemini-4-neon-high", "input_tokens": 60000, "cache_read_tokens": 0, "output_tokens": 600},
+            ],
+        )
+        snap = collect.collect_snapshot(self.app_dir, self.state_dir, active_cid="collapse-1", now_utc=now)
+        s = snap["sessions"]["collapse-1"]
+        self.assertTrue(s["cacheCollapsed"])
+        self.assertAlmostEqual(s["lastTurnCacheHitRate"], 0.0)
+        self.assertEqual(len(snap["dailyHistory"]), 14)
+        hist_map = {item["date"]: item["totalTokens"] for item in snap["dailyHistory"]}
+        self.assertEqual(hist_map["2026-11-23"], 100400)
+        self.assertEqual(hist_map["2026-11-24"], 211100)
+        self.assertTrue((self.state_dir / "usage-history.json").is_file())
+
 
 if __name__ == "__main__":
     unittest.main()

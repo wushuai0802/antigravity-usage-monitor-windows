@@ -159,7 +159,9 @@ internal static class StripBuilder
                 double? hr = (session != null && session.CacheHitRate.HasValue)
                     ? session.CacheHitRate
                     : (snap != null && snap.Today != null ? snap.Today.CacheHitRate : null);
-                items.Add(new StripItem { Key = key, Text = MetricFormatter.FormatHitRate(hr), Ink = pal.InkMuted });
+                bool collapsed = session != null && session.CacheCollapsed;
+                string ctxt = MetricFormatter.FormatHitRate(hr) + (collapsed ? " !" : "");
+                items.Add(new StripItem { Key = key, Text = ctxt, Ink = collapsed ? pal.WarnBrush : pal.InkMuted });
             }
             else if (key == "quota")
             {
@@ -246,6 +248,7 @@ internal sealed class OverlayController
     internal bool IsPanelOpen { get { return _panelOpen; } }
     internal volatile bool AutoRefreshQuotaEnabled;
     internal volatile int AutoRefreshIntervalMinutes;
+    internal volatile bool MilestoneAlertsEnabled;
 
     internal OverlayController(string stateDir, Action requestRefresh, Action requestQuotaRefresh)
     {
@@ -256,6 +259,7 @@ internal sealed class OverlayController
         _settings = OverlaySettings.Load(_settingsPath);
         AutoRefreshQuotaEnabled = _settings.AutoRefreshQuota;
         AutoRefreshIntervalMinutes = _settings.AutoRefreshIntervalMinutes;
+        MilestoneAlertsEnabled = _settings.EnableMilestoneAlerts;
         _dispatcher = Dispatcher.CurrentDispatcher;
 
         _strip = new PassiveWindow("Antigravity Usage Strip");
@@ -297,6 +301,49 @@ internal sealed class OverlayController
         {
             _snapshot = snap;
             RenderAndPlace();
+        }));
+    }
+
+    private System.Windows.Forms.NotifyIcon _toastIcon;
+    private DispatcherTimer _toastHideTimer;
+
+    internal void DisposeResources()
+    {
+        try
+        {
+            if (_toastHideTimer != null) _toastHideTimer.Stop();
+            if (_toastIcon != null) { _toastIcon.Visible = false; _toastIcon.Dispose(); _toastIcon = null; }
+        }
+        catch { }
+    }
+
+    internal void ShowMilestoneToast(MilestoneAlertEvent ev)
+    {
+        if (ev == null) return;
+        _dispatcher.BeginInvoke((Action)(() =>
+        {
+            try
+            {
+                if (_toastIcon == null)
+                {
+                    _toastIcon = new System.Windows.Forms.NotifyIcon { Text = "Antigravity Usage Monitor" };
+                }
+                if (_toastHideTimer == null)
+                {
+                    _toastHideTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(7) };
+                    _toastHideTimer.Tick += (s, e) =>
+                    {
+                        _toastHideTimer.Stop();
+                        try { if (_toastIcon != null) _toastIcon.Visible = false; } catch { }
+                    };
+                }
+                _toastIcon.Icon = ev.Critical ? System.Drawing.SystemIcons.Warning : System.Drawing.SystemIcons.Information;
+                _toastIcon.Visible = true;
+                _toastIcon.ShowBalloonTip(5000, ev.Title, ev.Body, ev.Critical ? System.Windows.Forms.ToolTipIcon.Warning : System.Windows.Forms.ToolTipIcon.Info);
+                _toastHideTimer.Stop();
+                _toastHideTimer.Start();
+            }
+            catch { }
         }));
     }
 
@@ -392,7 +439,7 @@ internal sealed class OverlayController
         if (_panelOpen)
         {
             FrameworkElement panelContent = BuildPanelElement(session, pal);
-            panelContent.Measure(new Size(560, 620));
+            panelContent.Measure(new Size(560, 780));
             double pw = Math.Ceiling(panelContent.DesiredSize.Width) + 12;
             double ph = Math.Ceiling(panelContent.DesiredSize.Height) + 12;
             double px = Math.Max(_anchor.Frame.Left + 8 * _anchor.Scale, Math.Min(place.Right - pw * _anchor.Scale, _anchor.Frame.Right - pw * _anchor.Scale - 8 * _anchor.Scale));
@@ -542,6 +589,11 @@ internal sealed class OverlayController
             grid.Children.Add(leftCard);
             grid.Children.Add(rightCard);
             rootStack.Children.Add(grid);
+
+            if (_settings.ShowTrendChart && _snapshot != null && _snapshot.DailyHistory != null && _snapshot.DailyHistory.Count > 0)
+            {
+                rootStack.Children.Add(BuildDailyTrendCard(_snapshot.DailyHistory, pal));
+            }
         }
 
         return new Border
@@ -571,7 +623,22 @@ internal sealed class OverlayController
             sp.Children.Add(MakeKv("生成速率", MetricFormatter.FormatRate(s.TokPerSec, s.TokPerSecEstimated), pal, pal.InkPrimary));
             sp.Children.Add(MakeKv("本会话累计", MetricFormatter.FormatTokens(s.SessionTokens), pal, pal.InkPrimary));
             sp.Children.Add(MakeKv("上次回答", MetricFormatter.FormatTokens(s.LastTurnTokens) + " (" + MetricFormatter.FormatDurationMs(s.LastTurnDurationMs) + ")", pal, pal.InkMuted));
-            sp.Children.Add(MakeKv("缓存命中率", MetricFormatter.FormatHitRate(s.CacheHitRate), pal, pal.InkPrimary));
+            sp.Children.Add(MakeKv("缓存命中率", MetricFormatter.FormatHitRate(s.CacheHitRate), pal, s.CacheCollapsed ? pal.WarnBrush : pal.InkPrimary));
+            if (s.CacheCollapsed)
+            {
+                string collapseMsg = string.Format(
+                    CultureInfo.InvariantCulture,
+                    "⚠ 缓存塌陷（上轮 {0}，注意额度骤降）",
+                    MetricFormatter.FormatHitRate(s.LastTurnCacheHitRate));
+                sp.Children.Add(new TextBlock
+                {
+                    Text = collapseMsg,
+                    FontFamily = UiFont,
+                    FontSize = 10.5,
+                    Foreground = pal.WarnBrush,
+                    Margin = new Thickness(0, 0, 0, 3)
+                });
+            }
             sp.Children.Add(MakeKv("上下文占用", string.Format(CultureInfo.InvariantCulture, "{0:0.0}% ({1})", s.ContextPct, MetricFormatter.FormatTokens(s.ContextTokens)), pal, s.ContextPct >= 80 ? pal.WarnBrush : pal.InkPrimary));
             sp.Children.Add(MakeProgressBar(s.ContextPct, s.ContextPct >= 80 ? pal.WarnBrush : pal.AccentGemini, pal));
             if (s.SubagentCount > 0)
@@ -677,7 +744,86 @@ internal sealed class OverlayController
                 Margin = new Thickness(0, 1, 0, 0)
             });
         }
+        if (p.BurnRate != null && !string.IsNullOrEmpty(p.BurnRate.SummaryText))
+        {
+            sp.Children.Add(new TextBlock
+            {
+                Text = p.BurnRate.SummaryText,
+                FontFamily = UiFont,
+                FontSize = 10.0,
+                Foreground = p.BurnRate.WillExhaustBeforeReset ? pal.WarnBrush : pal.InkMuted,
+                Margin = new Thickness(0, 1, 0, 1)
+            });
+        }
         return sp;
+    }
+
+    private Border BuildDailyTrendCard(List<DailyUsagePoint> points, ThemePalette pal)
+    {
+        var sp = new StackPanel();
+        long maxVal = 0;
+        long total14 = 0;
+        foreach (var pt in points)
+        {
+            if (pt.TotalTokens > maxVal) maxVal = pt.TotalTokens;
+            total14 += pt.TotalTokens;
+        }
+
+        var topRow = new DockPanel { Margin = new Thickness(0, 0, 0, 6) };
+        var sumBlock = new TextBlock
+        {
+            Text = "14日合计 " + MetricFormatter.FormatTokens(total14),
+            FontFamily = UiFont,
+            FontSize = 10.5,
+            Foreground = pal.InkMuted
+        };
+        DockPanel.SetDock(sumBlock, Dock.Right);
+        topRow.Children.Add(sumBlock);
+        topRow.Children.Add(new TextBlock
+        {
+            Text = "近 14 天 Token 趋势",
+            FontFamily = UiFont,
+            FontSize = 11.0,
+            FontWeight = FontWeights.SemiBold,
+            Foreground = pal.InkMuted
+        });
+        sp.Children.Add(topRow);
+
+        var chartGrid = new Grid { Height = 42 };
+        for (int i = 0; i < points.Count; i++)
+        {
+            chartGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            var pt = points[i];
+            double ratio = maxVal > 0 ? ((double)pt.TotalTokens / maxVal) : 0.0;
+            double barH = pt.TotalTokens > 0 ? Math.Max(3.0, Math.Round(ratio * 36.0)) : 2.0;
+            bool isToday = (i == points.Count - 1);
+            var bar = new Border
+            {
+                Height = barH,
+                VerticalAlignment = VerticalAlignment.Bottom,
+                Margin = new Thickness(2, 0, 2, 0),
+                CornerRadius = new CornerRadius(2, 2, 0, 0),
+                Background = pt.TotalTokens > 0 ? (isToday ? pal.AccentGemini : pal.AccentClaude) : pal.TrackBg,
+                Opacity = isToday ? 1.0 : (pt.TotalTokens > 0 ? 0.65 : 0.45),
+                ToolTip = string.Format(CultureInfo.InvariantCulture, "{0}：{1}", pt.Date, MetricFormatter.FormatTokens(pt.TotalTokens))
+            };
+            Grid.SetColumn(bar, i);
+            chartGrid.Children.Add(bar);
+        }
+        sp.Children.Add(chartGrid);
+
+        var axisRow = new DockPanel { Margin = new Thickness(0, 3, 0, 0) };
+        string firstLabel = points.Count > 0 && points[0].Date.Length >= 10 ? points[0].Date.Substring(5) : "";
+        string lastLabel = points.Count > 0 && points[points.Count - 1].Date.Length >= 10 ? points[points.Count - 1].Date.Substring(5) : "";
+        var endTxt = new TextBlock { Text = lastLabel + " (今日)", FontFamily = UiFont, FontSize = 9.5, Foreground = pal.InkMuted };
+        DockPanel.SetDock(endTxt, Dock.Right);
+        axisRow.Children.Add(endTxt);
+        axisRow.Children.Add(new TextBlock { Text = firstLabel, FontFamily = UiFont, FontSize = 9.5, Foreground = pal.InkMuted });
+        sp.Children.Add(axisRow);
+
+        var card = WrapCard(sp, pal);
+        card.Margin = new Thickness(0, 10, 0, 0);
+        return card;
     }
 
     private StackPanel BuildSettingsView(ThemePalette pal)
@@ -736,6 +882,41 @@ internal sealed class OverlayController
             intervalRow.Children.Add(ibtn);
         }
         sp.Children.Add(intervalRow);
+
+        var alertCb = new CheckBox
+        {
+            Content = "启用配额阈值桌面通知（5h ≤ 20%/10%，7d ≤ 10%/5%，每周期仅提醒一次）",
+            IsChecked = _settings.EnableMilestoneAlerts,
+            Foreground = pal.InkPrimary,
+            FontFamily = UiFont,
+            FontSize = 11.5,
+            Margin = new Thickness(0, 0, 0, 6)
+        };
+        alertCb.Click += (s, e) =>
+        {
+            _settings.EnableMilestoneAlerts = alertCb.IsChecked == true;
+            MilestoneAlertsEnabled = _settings.EnableMilestoneAlerts;
+            _settings.Save(_settingsPath);
+            RenderAndPlace();
+        };
+        sp.Children.Add(alertCb);
+
+        var trendCb = new CheckBox
+        {
+            Content = "在展开面板底部显示近 14 天 Token 趋势图",
+            IsChecked = _settings.ShowTrendChart,
+            Foreground = pal.InkPrimary,
+            FontFamily = UiFont,
+            FontSize = 11.5,
+            Margin = new Thickness(0, 0, 0, 10)
+        };
+        trendCb.Click += (s, e) =>
+        {
+            _settings.ShowTrendChart = trendCb.IsChecked == true;
+            _settings.Save(_settingsPath);
+            RenderAndPlace();
+        };
+        sp.Children.Add(trendCb);
 
         sp.Children.Add(SectionHeading("折叠条显示项与窄窗口保留顺序（越靠上越优先保留）", pal));
         var names = new Dictionary<string, string>
@@ -894,6 +1075,23 @@ internal sealed class OverlayController
         {
             ActiveConversationId = "demo",
             Today = new TodayStats { Date = now.ToString("yyyy-MM-dd"), TotalTokens = 1845200, CacheHitRate = 0.846, SessionsCount = 6 },
+            DailyHistory = new List<DailyUsagePoint>
+            {
+                new DailyUsagePoint { Date = "2026-11-11", TotalTokens = 42000000 },
+                new DailyUsagePoint { Date = "2026-11-12", TotalTokens = 88000000 },
+                new DailyUsagePoint { Date = "2026-11-13", TotalTokens = 31000000 },
+                new DailyUsagePoint { Date = "2026-11-14", TotalTokens = 0 },
+                new DailyUsagePoint { Date = "2026-11-15", TotalTokens = 65000000 },
+                new DailyUsagePoint { Date = "2026-11-16", TotalTokens = 112000000 },
+                new DailyUsagePoint { Date = "2026-11-17", TotalTokens = 79000000 },
+                new DailyUsagePoint { Date = "2026-11-18", TotalTokens = 135000000 },
+                new DailyUsagePoint { Date = "2026-11-19", TotalTokens = 94000000 },
+                new DailyUsagePoint { Date = "2026-11-20", TotalTokens = 51000000 },
+                new DailyUsagePoint { Date = "2026-11-21", TotalTokens = 128000000 },
+                new DailyUsagePoint { Date = "2026-11-22", TotalTokens = 160000000 },
+                new DailyUsagePoint { Date = "2026-11-23", TotalTokens = 142000000 },
+                new DailyUsagePoint { Date = "2026-11-24", TotalTokens = 189000000 }
+            },
             Sessions = new Dictionary<string, SessionStats>
             {
                 {
@@ -905,6 +1103,8 @@ internal sealed class OverlayController
                         ModelFamily = "gemini",
                         SessionTokens = 248100,
                         CacheHitRate = 0.846,
+                        LastTurnCacheHitRate = 0.12,
+                        CacheCollapsed = true,
                         LastTurnTokens = 52100,
                         LastTurnDurationMs = 11200,
                         TokPerSec = 48.2,
@@ -920,10 +1120,41 @@ internal sealed class OverlayController
             },
             Quota = new QuotaSnapshot
             {
-                Source = "agy-statusline",
+                Source = "uia",
+                UpdatedAtUtc = now.AddMinutes(-2),
                 PlanTier = "Pro",
-                Gemini = QuotaEvaluator.Evaluate("gemini", 25.0, now.AddHours(3).AddMinutes(15), now),
-                Claude = QuotaEvaluator.Evaluate("claude", 8.0, now.AddHours(3).AddMinutes(40), now)
+                Gemini = new PoolQuotaState
+                {
+                    Pool = "gemini",
+                    RemainingPct = 64.0,
+                    WindowKind = "5h",
+                    FiveHour = new PoolQuotaState
+                    {
+                        Pool = "gemini",
+                        RemainingPct = 64.0,
+                        WindowKind = "5h",
+                        CountdownText = "1h 15m",
+                        BurnRate = new BurnRateEstimate { PctPerHour = 18.5, WillExhaustBeforeReset = false, SummaryText = "-18.5%/h · 可安全撑到重置" }
+                    },
+                    Weekly = new PoolQuotaState { Pool = "gemini", RemainingPct = 91.0, WindowKind = "7d", CountdownText = "6d 15h" }
+                },
+                Claude = new PoolQuotaState
+                {
+                    Pool = "claude",
+                    RemainingPct = 8.0,
+                    WindowKind = "5h",
+                    FiveHour = new PoolQuotaState
+                    {
+                        Pool = "claude",
+                        RemainingPct = 8.0,
+                        WindowKind = "5h",
+                        CountdownText = "3h 40m",
+                        Alert = QuotaAlertLevel.Warn5h,
+                        AlertHint = "5h 紧张，可切另一模型家族",
+                        BurnRate = new BurnRateEstimate { PctPerHour = 12.0, WillExhaustBeforeReset = true, SummaryText = "-12%/h · 预计 40m 后耗尽（早于重置）" }
+                    },
+                    Weekly = new PoolQuotaState { Pool = "claude", RemainingPct = 56.0, WindowKind = "7d", CountdownText = "6d 22h" }
+                }
             }
         };
 
@@ -933,7 +1164,7 @@ internal sealed class OverlayController
         {
             var pal = ThemePalette.For(light);
             var panel = ctrl.BuildPanelElement(sample.Sessions["demo"], pal);
-            panel.Measure(new Size(560, 620));
+            panel.Measure(new Size(560, 780));
             panel.Arrange(new Rect(new Point(0, 0), panel.DesiredSize));
             panel.UpdateLayout();
             var rtb = new RenderTargetBitmap((int)Math.Ceiling(panel.DesiredSize.Width * 2), (int)Math.Ceiling(panel.DesiredSize.Height * 2), 192, 192, PixelFormats.Pbgra32);
