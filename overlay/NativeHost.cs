@@ -389,32 +389,75 @@ internal sealed class AnchorFinder
         try
         {
             AutomationElement dialogScope = FindQuotaDialogScope(root);
-            AutomationElement scopeRoot = dialogScope ?? root;
-            var cond = new OrCondition(
-                new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Text),
-                new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Header));
-            var nodes = scopeRoot.FindAll(TreeScope.Descendants, cond);
-            var lines = new List<string>();
-            int limit = Math.Min(nodes.Count, 2400);
-            for (int i = 0; i < limit; i++)
+            if (dialogScope != null && ScanElementForQuota(dialogScope, stateDir, true, false)) return;
+            if (ScanElementForQuota(root, stateDir, false, fastMode)) return;
+
+            // If a menu/popover is open, also check sibling popup HWNDs belonging to the same Antigravity process.
+            if (fastMode && _window != IntPtr.Zero)
             {
-                try
+                uint hostPid;
+                Native.GetWindowThreadProcessId(_window, out hostPid);
+                var siblingPopups = new List<IntPtr>();
+                Native.EnumWindows((w, unused) =>
                 {
-                    var el = nodes[i];
-                    // Inside an open quota modal, read scrolled-off rows too (e.g. Claude pool below fold).
-                    if (dialogScope == null && el.Current.IsOffscreen) continue;
-                    string n = el.Current.Name;
-                    if (!string.IsNullOrWhiteSpace(n) && n.Length <= 48) lines.Add(n.Trim());
+                    if (w == _window || !Native.Live(w)) return true;
+                    uint pid;
+                    Native.GetWindowThreadProcessId(w, out pid);
+                    if (pid == hostPid) siblingPopups.Add(w);
+                    return true;
+                }, IntPtr.Zero);
+                foreach (IntPtr pop in siblingPopups)
+                {
+                    var popEl = AutomationElement.FromHandle(pop);
+                    if (popEl != null && ScanElementForQuota(popEl, stateDir, true, true)) return;
                 }
-                catch { }
-            }
-            PoolQuotaState g, c;
-            if (UiaQuotaParser.TryParseFromLines(lines, DateTime.UtcNow, out g, out c))
-            {
-                DualSlotStore.WriteQuotaFromUia(stateDir, g, c, DateTime.UtcNow);
             }
         }
         catch { }
+    }
+
+    private static bool ScanElementForQuota(AutomationElement scopeRoot, string stateDir, bool includeOffscreen, bool logMiss)
+    {
+        var cond = new OrCondition(
+            new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Text),
+            new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Header),
+            new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.MenuItem),
+            new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.ListItem));
+        var nodes = scopeRoot.FindAll(TreeScope.Descendants, cond);
+        var lines = new List<string>();
+        int limit = Math.Min(nodes.Count, 2600);
+        for (int i = 0; i < limit; i++)
+        {
+            try
+            {
+                var el = nodes[i];
+                if (!includeOffscreen && el.Current.IsOffscreen) continue;
+                string n = el.Current.Name;
+                if (string.IsNullOrWhiteSpace(n) || n.Length > 64) continue;
+                foreach (string part in n.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
+                {
+                    string t = part.Trim();
+                    if (t.Length > 0 && t.Length <= 48) lines.Add(t);
+                }
+            }
+            catch { }
+        }
+        PoolQuotaState g, c;
+        if (UiaQuotaParser.TryParseFromLines(lines, DateTime.UtcNow, out g, out c))
+        {
+            DualSlotStore.WriteQuotaFromUia(stateDir, g, c, DateTime.UtcNow);
+            return true;
+        }
+        if (logMiss)
+        {
+            int anchorIdx = lines.FindIndex(l => l == "使用量" || l == "模型额度" || l.Equals("Usage", StringComparison.OrdinalIgnoreCase));
+            if (anchorIdx >= 0)
+            {
+                var snippet = lines.Skip(anchorIdx).Take(20).ToArray();
+                Program.Note("quota-scan-miss: " + string.Join(" | ", snippet));
+            }
+        }
+        return false;
     }
 
     private static AutomationElement FindQuotaDialogScope(AutomationElement root)
